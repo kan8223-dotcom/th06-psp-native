@@ -1,0 +1,64 @@
+// th06_ps3 cxxcompat: std::mutex for gthreads-less GCC7.
+// Real lv2 kernel mutex (sysMutex) - the earlier spinlock+sysThreadYield livelocked
+// on RPCS3 when the BGM thread held the lock during file I/O (frame-0 hang, 3 hits).
+#pragma once
+#include_next <mutex>
+
+#ifndef _GLIBCXX_HAS_GTHREADS
+
+#ifdef __PSL1GHT__
+#include <cstring>
+#include <sys/mutex.h>
+#endif
+
+namespace std
+{
+class mutex
+{
+#ifdef __PSL1GHT__
+    sys_mutex_t m = 0;
+    bool inited = false;
+
+    void ensure()
+    {
+        if (!inited)
+        {
+            sys_mutex_attr_t attr;
+            sysMutexAttrInitialize(attr);
+            std::strncpy(attr.name, "th06mtx", sizeof(attr.name));
+            if (sysMutexCreate(&m, &attr) == 0)
+                inited = true;
+        }
+    }
+#endif
+
+  public:
+    mutex() = default;
+    mutex(const mutex &) = delete;
+    void lock()
+    {
+#ifdef __PSL1GHT__
+        ensure();
+        if (inited)
+            sysMutexLock(m, 0); // 0 = no timeout
+#endif
+    }
+    void unlock()
+    {
+#ifdef __PSL1GHT__
+        if (inited)
+            sysMutexUnlock(m);
+#endif
+    }
+    bool try_lock()
+    {
+#ifdef __PSL1GHT__
+        ensure();
+        return inited && sysMutexTryLock(m) == 0;
+#else
+        return true;
+#endif
+    }
+};
+} // namespace std
+#endif

@@ -1,0 +1,8 @@
+obj/
+*.o
+*.d
+*.elf
+*.prx
+EBOOT.PBP
+PARAM.SFO
+build/

@@ -1,0 +1,96 @@
+// th06_ps3 cxxcompat: std::thread over PSL1GHT sysThreadCreate (gthreads-less GCC7).
+// Used by SoundPlayer's BGM streaming thread.
+#pragma once
+#include_next <thread>
+
+#ifndef _GLIBCXX_HAS_GTHREADS
+
+#include <functional>
+#ifdef __PSL1GHT__
+#include <sys/thread.h>
+#endif
+
+namespace std
+{
+class thread
+{
+    bool active = false;
+#ifdef __PSL1GHT__
+    sys_ppu_thread_t tid = 0;
+
+    struct Trampoline
+    {
+        std::function<void()> fn;
+    };
+
+    static void Entry(void *arg)
+    {
+        Trampoline *t = (Trampoline *)arg;
+        t->fn();
+        delete t;
+        sysThreadExit(0);
+    }
+#endif
+
+  public:
+    thread() = default;
+
+    template <typename F, typename... Args> explicit thread(F &&f, Args &&... args)
+    {
+#ifdef __PSL1GHT__
+        Trampoline *t = new Trampoline{std::bind(std::forward<F>(f), std::forward<Args>(args)...)};
+        // priority 1500 (below main), 64KB stack
+        if (sysThreadCreate(&tid, &thread::Entry, t, 1500, 0x10000, THREAD_JOINABLE, (char *)"th06_bgm") == 0)
+        {
+            active = true;
+        }
+        else
+        {
+            delete t;
+            active = false;
+        }
+#endif
+    }
+
+    thread(const thread &) = delete;
+    thread(thread &&other) : active(other.active)
+    {
+#ifdef __PSL1GHT__
+        tid = other.tid;
+        other.tid = 0;
+#endif
+        other.active = false;
+    }
+    thread &operator=(thread &&other)
+    {
+        active = other.active;
+#ifdef __PSL1GHT__
+        tid = other.tid;
+        other.tid = 0;
+#endif
+        other.active = false;
+        return *this;
+    }
+
+    bool joinable() const
+    {
+        return active;
+    }
+    void join()
+    {
+#ifdef __PSL1GHT__
+        if (active)
+        {
+            u64 retval;
+            sysThreadJoin(tid, &retval);
+        }
+#endif
+        active = false;
+    }
+    void detach()
+    {
+        active = false;
+    }
+};
+} // namespace std
+#endif
