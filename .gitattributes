@@ -1,0 +1,3 @@
+# Keep the vendored m-c/d source byte-for-byte; its upstream style includes
+# trailing whitespace that must not make this repository's diff audit fail.
+psp/third_party/me-custom-core/** -whitespace

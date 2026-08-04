@@ -3,14 +3,38 @@
 // Stub: video/renderer/audio/input/image/ttf — replaced by PS3 backends in later phases
 #include <SDL2/SDL_shim.h>
 #include <algorithm>
+#if defined(TH06_PSP) || defined(__PSL1GHT__)
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#endif
 #if defined(TH06_PS3) && defined(__PSL1GHT__)
 extern "C" char th06_basedir[512]; // ps3/sentry_guest.cpp
 #endif
 
-#ifdef __PSL1GHT__
-#include <ft2build.h>
+#ifdef TH06_PSP
+#include <pspkernel.h>
+#include "fileio.hpp"
+extern "C" int th06_psp_video_init(void);
+extern "C" void th06_psp_video_present(const unsigned int *src, int w, int h, int srcPitchBytes);
+extern "C" void th06_psp_input_poll(unsigned char *keystate, unsigned int count);
+extern "C" int th06_psp_audio_init(void);
+extern "C" void th06_psp_audio_queue(const short *pcm, unsigned int bytes);
+extern "C" unsigned int th06_psp_audio_queued_bytes(void);
+extern "C" void th06_psp_audio_shutdown(void);
+extern "C" void th06_psp_boot_note(const char *message);
+extern "C" int th06_psp_boot_phase(void);
+static const void *g_LastTexPixels;
+static int g_LastTexPitch;
+// GameWindow's own backend breadcrumbs are inside PS3 guards, so the shim is
+// the only place the PSP can see the window/renderer stages from.  Boot scoped:
+// silent from the first presented frame onwards.
+static void ShimBootNote(const char *message)
+{
+    if (th06_psp_boot_phase())
+        th06_psp_boot_note(message);
+}
+#elif defined(__PSL1GHT__)
 #include <sys/systime.h>
-#include FT_FREETYPE_H
 #if defined(TH06_ARCADE_EMBED) && TH06_ARCADE_EMBED
 extern "C" void th06_arcade_present(const unsigned int *src, int w, int h, int srcPitchBytes);
 #else
@@ -43,6 +67,9 @@ void SDL_Log(const char *fmt, ...)
 // ---------------------------------------------------------------- init
 int SDL_Init(Uint32)
 {
+#ifdef TH06_PSP
+    ShimBootNote("SDL INIT");
+#endif
     return 0;
 }
 int SDL_InitSubSystem(Uint32)
@@ -60,7 +87,9 @@ SDL_bool SDL_SetHint(const char *, const char *)
 // ---------------------------------------------------------------- timer
 Uint64 SDL_GetTicks64(void)
 {
-#ifdef __PSL1GHT__
+#ifdef TH06_PSP
+    return sceKernelGetSystemTimeWide() / 1000ull;
+#elif defined(__PSL1GHT__)
     u64 sec, nsec;
     sysGetCurrentTime(&sec, &nsec);
     return sec * 1000ull + nsec / 1000000ull;
@@ -74,7 +103,9 @@ Uint32 SDL_GetTicks(void)
 }
 void SDL_Delay(Uint32 ms)
 {
-#ifdef __PSL1GHT__
+#if defined(TH06_PSP)
+    sceKernelDelayThread(ms * 1000);
+#elif defined(__PSL1GHT__)
     sysUsleep(ms * 1000);
 #else
     (void)ms;
@@ -199,6 +230,57 @@ int SDL_BYTESPERPIXEL(Uint32 fmt)
     return SDL_BITSPERPIXEL(fmt) / 8;
 }
 
+#ifdef TH06_PSP
+static SDL_Surface *g_PspSurfaces[128];
+static Uint32 g_PspNextSurfaceSerial;
+static Uint32 g_PspLastLockedSurfaceSerial;
+
+static void PspRegisterSurface(SDL_Surface *surface)
+{
+    surface->pspSerial = ++g_PspNextSurfaceSerial;
+    if (surface->pspSerial == 0)
+        surface->pspSerial = ++g_PspNextSurfaceSerial;
+    for (unsigned int i = 0; i < sizeof(g_PspSurfaces) / sizeof(g_PspSurfaces[0]); ++i)
+    {
+        if (!g_PspSurfaces[i])
+        {
+            g_PspSurfaces[i] = surface;
+            return;
+        }
+    }
+}
+
+static void PspUnregisterSurface(SDL_Surface *surface)
+{
+    for (unsigned int i = 0; i < sizeof(g_PspSurfaces) / sizeof(g_PspSurfaces[0]); ++i)
+    {
+        if (g_PspSurfaces[i] == surface)
+        {
+            g_PspSurfaces[i] = nullptr;
+            return;
+        }
+    }
+}
+
+extern "C" Uint32 th06_psp_last_locked_surface_serial()
+{
+    return g_PspLastLockedSurfaceSerial;
+}
+
+extern "C" void th06_psp_mark_surface_ge_cached(Uint32 serial, int cached)
+{
+    for (unsigned int i = 0; i < sizeof(g_PspSurfaces) / sizeof(g_PspSurfaces[0]); ++i)
+    {
+        SDL_Surface *surface = g_PspSurfaces[i];
+        if (surface && surface->pspSerial == serial)
+        {
+            surface->pspGeCached = cached != 0;
+            return;
+        }
+    }
+}
+#endif
+
 SDL_Surface *SDL_CreateRGBSurfaceWithFormat(Uint32, int width, int height, int, Uint32 format)
 {
     SDL_Surface *s = (SDL_Surface *)std::calloc(1, sizeof(SDL_Surface));
@@ -211,6 +293,9 @@ SDL_Surface *SDL_CreateRGBSurfaceWithFormat(Uint32, int width, int height, int, 
     s->pitch = width * s->format->BytesPerPixel;
     s->pixels = std::calloc(1, (size_t)s->pitch * height);
     s->refcount = 1;
+#ifdef TH06_PSP
+    PspRegisterSurface(s);
+#endif
     return s;
 }
 SDL_Surface *SDL_CreateRGBSurfaceWithFormatFrom(void *pixels, int width, int height, int depth, int pitch, Uint32 format)
@@ -228,17 +313,44 @@ void SDL_FreeSurface(SDL_Surface *surface)
 {
     if (!surface)
         return;
+#ifdef TH06_PSP
+    PspUnregisterSurface(surface);
+#endif
     if (!(surface->flags & 1))
         std::free(surface->pixels);
     std::free(surface->format);
     std::free(surface);
 }
-int SDL_LockSurface(SDL_Surface *)
+int SDL_LockSurface(SDL_Surface *surface)
 {
+#ifdef TH06_PSP
+    if (surface)
+    {
+        g_PspLastLockedSurfaceSerial = surface->pspSerial;
+        surface->pspSavedHeight = 0;
+        if (surface->pspGeCached && surface->h > 0)
+        {
+            // AnmManager::ExtractSurfacePixels computes and loops over h while
+            // the surface is locked.  A cached immutable JPEG needs no second
+            // 900 KiB copy; Unlock restores h before the backend receives the
+            // content rectangle.  The backend hit path never dereferences the
+            // resulting zero-length temporary allocation.
+            surface->pspSavedHeight = surface->h;
+            surface->h = 0;
+        }
+    }
+#endif
     return 0;
 }
-void SDL_UnlockSurface(SDL_Surface *)
+void SDL_UnlockSurface(SDL_Surface *surface)
 {
+#ifdef TH06_PSP
+    if (surface && surface->pspSavedHeight > 0)
+    {
+        surface->h = surface->pspSavedHeight;
+        surface->pspSavedHeight = 0;
+    }
+#endif
 }
 static bool SDL_ReadPixelRGBA(const SDL_Surface *s, int x, int y, Uint8 *r, Uint8 *g, Uint8 *b, Uint8 *a)
 {
@@ -466,7 +578,10 @@ int SDL_SetSurfaceBlendMode(SDL_Surface *, SDL_BlendMode)
 // ---------------------------------------------------------------- video/renderer stubs
 SDL_Window *SDL_CreateWindow(const char *, int, int, int, int, Uint32)
 {
-#if defined(__PSL1GHT__) && !(defined(TH06_ARCADE_EMBED) && TH06_ARCADE_EMBED)
+#if defined(TH06_PSP)
+    ShimBootNote("SDL CREATEWINDOW");
+    th06_psp_video_init();
+#elif defined(__PSL1GHT__) && !(defined(TH06_ARCADE_EMBED) && TH06_ARCADE_EMBED)
     th06_video_init();
 #endif
     static int dummy;
@@ -478,12 +593,23 @@ void SDL_DestroyWindow(SDL_Window *)
 void SDL_GetWindowSize(SDL_Window *, int *w, int *h)
 {
     if (w)
+#ifdef TH06_PSP
+        *w = 480;
+#else
         *w = 640;
+#endif
     if (h)
+#ifdef TH06_PSP
+        *h = 272;
+#else
         *h = 480;
+#endif
 }
 SDL_Renderer *SDL_CreateRenderer(SDL_Window *, int, Uint32)
 {
+#ifdef TH06_PSP
+    ShimBootNote("SDL CREATERENDERER");
+#endif
     static int dummy;
     return (SDL_Renderer *)&dummy;
 }
@@ -492,6 +618,9 @@ void SDL_DestroyRenderer(SDL_Renderer *)
 }
 SDL_Texture *SDL_CreateTexture(SDL_Renderer *, Uint32, int, int, int)
 {
+#ifdef TH06_PSP
+    ShimBootNote("SDL CREATETEXTURE");
+#endif
     static int dummy;
     return (SDL_Texture *)&dummy;
 }
@@ -505,7 +634,7 @@ void SDL_DestroyTexture(SDL_Texture *)
 }
 int SDL_UpdateTexture(SDL_Texture *, const SDL_Rect *, const void *pixels, int pitch)
 {
-#ifdef __PSL1GHT__
+#if defined(TH06_PSP) || defined(__PSL1GHT__)
     g_LastTexPixels = pixels;
     g_LastTexPitch = pitch;
 #endif
@@ -541,7 +670,10 @@ int SDL_SetRenderDrawColor(SDL_Renderer *, Uint8, Uint8, Uint8, Uint8)
 }
 void SDL_RenderPresent(SDL_Renderer *)
 {
-#ifdef __PSL1GHT__
+#if defined(TH06_PSP)
+    if (g_LastTexPixels)
+        th06_psp_video_present((const unsigned int *)g_LastTexPixels, 480, 272, g_LastTexPitch);
+#elif defined(__PSL1GHT__)
     if (g_LastTexPixels)
 #if defined(TH06_ARCADE_EMBED) && TH06_ARCADE_EMBED
         th06_arcade_present((const unsigned int *)g_LastTexPixels,
@@ -590,7 +722,7 @@ int SDL_ShowCursor(int)
 {
     return 0;
 }
-#ifdef __PSL1GHT__
+#if defined(TH06_PSP) || defined(__PSL1GHT__)
 extern "C" void th06_pad_poll(unsigned char *keystate);
 extern "C" void th06_kb_poll(unsigned char *keystate);
 extern "C" int th06_pad_game_input_blocked(void);
@@ -601,7 +733,9 @@ const Uint8 *SDL_GetKeyboardState(int *numkeys)
     static Uint8 state[SDL_NUM_SCANCODES];
     if (numkeys)
         *numkeys = SDL_NUM_SCANCODES;
-#ifdef __PSL1GHT__
+#if defined(TH06_PSP)
+    th06_psp_input_poll(state, SDL_NUM_SCANCODES);
+#elif defined(__PSL1GHT__)
     // Pad keeps its own last-known state in padstate (pad-001: len=0 keeps
     // previous sample). Compose pad|keyboard fresh each poll so a keyboard
     // release is never masked by a stale merged array.
@@ -678,7 +812,10 @@ SDL_AudioDeviceID SDL_OpenAudioDevice(const char *, int, const SDL_AudioSpec *de
 {
     if (obtained && desired)
         *obtained = *desired;
-#ifdef __PSL1GHT__
+#ifdef TH06_PSP
+    if (th06_psp_audio_init() != 0)
+        return 0;
+#elif defined(__PSL1GHT__)
     if (th06_audio_init() != 0)
         return 0;
 #endif
@@ -686,13 +823,18 @@ SDL_AudioDeviceID SDL_OpenAudioDevice(const char *, int, const SDL_AudioSpec *de
 }
 void SDL_CloseAudioDevice(SDL_AudioDeviceID)
 {
+#ifdef TH06_PSP
+    th06_psp_audio_shutdown();
+#endif
 }
 void SDL_PauseAudioDevice(SDL_AudioDeviceID, int)
 {
 }
 int SDL_QueueAudio(SDL_AudioDeviceID, const void *data, Uint32 len)
 {
-#ifdef __PSL1GHT__
+#ifdef TH06_PSP
+    th06_psp_audio_queue((const short *)data, len);
+#elif defined(__PSL1GHT__)
     th06_audio_queue((const short *)data, len);
     th06_audio_pump();
 #endif
@@ -700,7 +842,9 @@ int SDL_QueueAudio(SDL_AudioDeviceID, const void *data, Uint32 len)
 }
 Uint32 SDL_GetQueuedAudioSize(SDL_AudioDeviceID)
 {
-#ifdef __PSL1GHT__
+#ifdef TH06_PSP
+    return th06_psp_audio_queued_bytes();
+#elif defined(__PSL1GHT__)
     th06_audio_pump();
     return th06_audio_backlog_bytes();
 #else
@@ -934,7 +1078,7 @@ void IMG_Quit(void)
 {
 }
 
-#ifdef __PSL1GHT__
+#if defined(TH06_PSP) || defined(__PSL1GHT__)
 struct TTF_GlyphCacheEntry
 {
     Uint32 codepoint;
@@ -969,6 +1113,20 @@ static bool TTF_ResolvePath(const char *file, char *out, size_t outSize)
         snprintf(out, outSize, "%s", file);
         return true;
     }
+
+#ifdef TH06_PSP
+    // Distributed free font lives beside EBOOT.  Also accept a user-provided
+    // font inside the copied th6 directory without modifying that directory.
+    snprintf(out, outSize, "%s/%s", th06_psp_game_dir(), file);
+    FILE *fontFile = std::fopen(out, "rb");
+    if (fontFile)
+    {
+        std::fclose(fontFile);
+        return true;
+    }
+    snprintf(out, outSize, "%s/%s", th06_psp_data_dir(), file);
+    return true;
+#endif
 
 #if defined(TH06_PS3) && defined(TH06_PS3_BASEDIR)
     snprintf(out, outSize, "%s/%s", th06_basedir, file);
@@ -1154,6 +1312,10 @@ TTF_Font *TTF_OpenFont(const char *file, int ptsize)
     {
         std::free(font);
         ShimSetError("TTF_OpenFont: FT_New_Face failed");
+#ifdef TH06_PSP
+        if (th06_psp_boot_phase())
+            th06_psp_boot_notef("TTF FONT NG %s", file);
+#endif
         return nullptr;
     }
 
@@ -1166,6 +1328,11 @@ TTF_Font *TTF_OpenFont(const char *file, int ptsize)
         ShimSetError("TTF_OpenFont: FT_Set_Pixel_Sizes failed");
         return nullptr;
     }
+
+#ifdef TH06_PSP
+    if (th06_psp_boot_phase())
+        th06_psp_boot_notef("TTF FONT OK %s", file);
+#endif
 
     return font;
 }

@@ -8,6 +8,8 @@
 #include <functional>
 #ifdef __PSL1GHT__
 #include <sys/thread.h>
+#elif defined(TH06_PSP)
+#include <pspthreadman.h>
 #endif
 
 namespace std
@@ -17,6 +19,8 @@ class thread
     bool active = false;
 #ifdef __PSL1GHT__
     sys_ppu_thread_t tid = 0;
+#elif defined(TH06_PSP)
+    SceUID tid = -1;
 
     struct Trampoline
     {
@@ -29,6 +33,15 @@ class thread
         t->fn();
         delete t;
         sysThreadExit(0);
+    }
+#elif defined(TH06_PSP)
+    static int Entry(SceSize, void *arg)
+    {
+        Trampoline *t = (Trampoline *)arg;
+        t->fn();
+        delete t;
+        sceKernelExitDeleteThread(0);
+        return 0;
     }
 #endif
 
@@ -49,6 +62,18 @@ class thread
             delete t;
             active = false;
         }
+#elif defined(TH06_PSP)
+        Trampoline *t = new Trampoline{std::bind(std::forward<F>(f), std::forward<Args>(args)...)};
+        tid = sceKernelCreateThread("th06_bgm", &thread::Entry, 0x20, 0x10000, PSP_THREAD_ATTR_USER, nullptr);
+        if (tid >= 0 && sceKernelStartThread(tid, sizeof(t), t) >= 0)
+        {
+            active = true;
+        }
+        else
+        {
+            delete t;
+            tid = -1;
+        }
 #endif
     }
 
@@ -58,6 +83,9 @@ class thread
 #ifdef __PSL1GHT__
         tid = other.tid;
         other.tid = 0;
+#elif defined(TH06_PSP)
+        tid = other.tid;
+        other.tid = -1;
 #endif
         other.active = false;
     }
@@ -67,6 +95,9 @@ class thread
 #ifdef __PSL1GHT__
         tid = other.tid;
         other.tid = 0;
+#elif defined(TH06_PSP)
+        tid = other.tid;
+        other.tid = -1;
 #endif
         other.active = false;
         return *this;
@@ -84,6 +115,9 @@ class thread
             u64 retval;
             sysThreadJoin(tid, &retval);
         }
+#elif defined(TH06_PSP)
+        if (active)
+            sceKernelWaitThreadEnd(tid, nullptr);
 #endif
         active = false;
     }

@@ -17,7 +17,7 @@ description: PSP ハードウェア + homebrew 開発知見の統合知識ベー
 
 # PSP ハードウェア + 開発知識ベース (統合版)
 
-最終更新: 2026-04-09。psp-hardware-knowledge / psp-pmdvis-day-20260408 / pmd-psp-session-20260407 の 3 スキルを統合。2026-04-09 に AI ハルシネーション訂正 4 件 + ※マーキングルール導入 + 新発見 (起動デモ正体、Tiny-ME 真相、Sony 純正 ME プログラム用途、psdevwiki 貢献者実名) 追記。
+最終更新: 2026-04-09。psp-hardware-knowledge / psp-pmdvis-day-20260408 / pmd-psp-session-20260407 の 3 スキルを統合。2026-04-09 に AI ハルシネーション訂正 4 件 + ※マーキングルール導入 + 新発見 (起動デモ正体、MECC旧称問題、Sony 純正 ME プログラム用途、psdevwiki 貢献者実名) 追記。
 
 ## ★★★ 信頼度表記ルール (※ マーキング) ★★★
 
@@ -45,12 +45,12 @@ description: PSP ハードウェア + homebrew 開発知見の統合知識ベー
 - 検出: 2026-04-08 23:39 Discord、m-c/d 本人から指摘
 - 一次情報源: Hot Chips 16 (2004) p.14 + Wikimedia Commons 基板写真
 
-### ❌ 訂正 2: Tiny-ME ライブラリ名累犯
-- **誤**: MECC を "Tiny-ME" と表記 (複数媒体で累犯)
+### ❌ 訂正 2: MECCの旧リポジトリ名を現行名として扱った
+- **誤**: MECCを廃止済みの旧リポジトリ名で表記 (複数媒体で累犯)
 - **正**: **psp-media-engine-custom-core (MECC)**
-- 真相: 2024-25 年頃、m-c/d 本人が pspdev org 下で `tiny-me` という名前で運営していた旧リポジトリ名 (実在) だった。その後 `mcidclan/psp-media-engine-custom-core` にリネーム。田中のローカル環境に旧 submodule フォルダ `tiny-me/` が残存し、Claude がフォルダ名を直接参照して「Tiny-ME」と書き続けた。**純粋な無からのハルシネーションではなく、情報の古さ + ローカルファイル構造への依存 + ルール化の限界の複合的な誤り**。
-- 検出: 2026-04-08 20:21 Discord、m-c/d "it is not Tiny ME"
-- **旧称 (Tiny-ME / TinyME / t***-me / T***yMe 等) 使用禁止** (憲法第 8 条適用)
+- 真相: 2024-25 年頃の旧リポジトリ名がローカルsubmodule名として残存し、Claudeがそれを現行名と誤認した。その後の現行名は`mcidclan/psp-media-engine-custom-core`。**情報の古さ + ローカルファイル構造への依存 + ルール化の限界の複合的な誤り**。
+- 検出: 2026-04-08 20:21 Discord、m-c/d本人から現行名への訂正
+- **旧リポジトリ名は使用禁止** (憲法第 8 条適用)
 
 ### ❌ 訂正 3: VME = Virtual Mobile Engine 2 (書面未確認)
 - **誤**: "Virtual Mobile Engine **2**"
@@ -457,12 +457,12 @@ SC 側 eDRAM はデフォルト 2MB、`sceGeEdramSetSize(0x400000)` で 4MB に�
 ### 正式名称
 - **正式名**: psp-media-engine-custom-core
 - **略称**: me-custom-core / MECC
-- **旧称使用禁止**: Tiny-ME / TinyME / t***-me / T***yMe 等 (憲法第 8 条適用)
+- **旧称使用禁止**: 廃止済みの旧リポジトリ名を現行名として使わない (憲法第 8 条適用)
 
-### Tiny-ME 旧称の歴史 (重要)
-- 2024-25 年頃、m-c/d 本人が pspdev org 下で `tiny-me` という名前でリポジトリ運営していた (実在)
+### 旧リポジトリ名の履歴 (重要)
+- 2024-25 年頃、m-c/d本人がpspdev org下で前身リポジトリを運営していた
 - その後 `mcidclan/psp-media-engine-custom-core` にリネーム
-- 田中ローカル環境には旧 submodule フォルダ `tiny-me/` が残存
+- 田中ローカル環境には旧名のsubmoduleフォルダが残存
 - **旧称は過去には実在したが、現在は使用禁止**。ローカルフォルダ名の物理的残存も修正対象
 
 ### 正規入手ルート
@@ -516,7 +516,7 @@ SC 側 eDRAM はデフォルト 2MB、`sceGeEdramSetSize(0x400000)` で 4MB に�
 
 3. **submodule 汚染**
    - 症状: 本体リポジトリをリビルドすると ME OFF
-   - 原因: submodule (旧称 tiny-me 等) 内の `me-lib.c` / `libme-core.a` が MECC 化の変更を残してる
+   - 原因: 旧submodule内の`me-lib.c` / `libme-core.a`がMECC化の変更を残してる
    - 対処: `git checkout -- <files>` → `rm -rf build && cmake .. && make`
    - **教訓**: 動いている EBOOT があるなら触るな。バックアップ EBOOT を常に保持
 
@@ -555,7 +555,7 @@ SC 側 eDRAM はデフォルト 2MB、`sceGeEdramSetSize(0x400000)` で 4MB に�
 
 | サンプル名 | 用途 |
 |---|---|
-| tiny-me-lib (旧名) | サンプル集、後に MECC に発展 |
+| MECC前身のsample群 | サンプル集、後にMECCへ発展 |
 | me-minimal-handler | 最小リセットハンドラ |
 | me-spinlock | HW spinlock を使った SC-ME 間 mutex |
 | me-dmacplus-transfer | DMACPlus を使った SC-ME 間データ転送 |
@@ -984,7 +984,7 @@ Tachyon / Media Engine ページの主要貢献者 (Claude Code 調査より):
 - **2026-04-05**: Note コメント欄で KOMMANDO (KOMSTATION 編集者) 初接触、psp-me-bench 追記版公開
 - **2026-04-07**: pmd_psp v1.1 完成セッション (14 時間+)、MECC 全滅問題の m-c/d 報告完遂
 - **2026-04-08**: psp-pmdvis GitHub public 公開、Discord #media-engine 5 時間戦記、m-c/d + Acid_Snake + Staff D から受容、m-c/d から eDRAM 8MB 情報開示、CXR704060 ハルシネーション訂正、田中パッチが m-c/d upstream 反映予定に
-- **2026-04-09**: Tiny-ME 累犯発覚 + 真相判明 (pspdev/tiny-me 旧実在名)、同人誌執筆準備、PSP 関連 skill 訂正セッション
+- **2026-04-09**: MECC旧称の累犯発覚 + 真相判明、同人誌執筆準備、PSP関連skill訂正セッション
 
 ### 2026-04-07 夜: pmd_psp v1.1 完成セッション
 
@@ -1021,7 +1021,7 @@ Tachyon / Media Engine ページの主要貢献者 (Claude Code 調査より):
 
 **Code 暴走 3 回**:
 1. streaming ブランチで diff 見せずデプロイ → ME OFF → 証拠破壊
-2. submodule 汚染 (旧称 tiny-me の me-lib.c を MECC 化)
+2. submodule汚染 (旧submoduleのme-lib.cをMECC化)
 3. kcall.prx 配置疑惑 → 後で無罪確定 (監督役 Claude の冤罪)
 
 ### 2026-04-08: psp-pmdvis 大戦記、PSP Homebrew Community 正式デビュー
@@ -1085,10 +1085,10 @@ Tachyon / Media Engine ページの主要貢献者 (Claude Code 調査より):
 - OC 周波数は個体差あり、全機種で保証されない
 - 新しい発見があればコミュニティで訂正される可能性あり
 - **重要**: 推測と事実を区別すること (憲法第 7 条)。一次情報源を必ず確認する
-- **重要**: 旧称 (Tiny-ME / TinyME / t***-me / T***yMe 等) 使用禁止 (憲法第 8 条)
+- **重要**: MECCの廃止済み旧称を使用しない (憲法第 8 条)
 - **重要**: ymfm 聖域違反禁止 (憲法第 8 条)
 - **重要**: ※ マーキング付きの記述を外部発信時に引用する場合、必ず留保または出典明記
-- **重要**: 過去の AI ハルシネーション 4 件 (CXR704060 / Tiny-ME / VME2 / CGRA) を告白の対象として記録
+- **重要**: 過去の AI ハルシネーション 4 件 (CXR704060 / MECC旧称 / VME2 / CGRA) を告白の対象として記録
 
 ### 歴史的観点
 

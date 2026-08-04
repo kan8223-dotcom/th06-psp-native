@@ -478,7 +478,7 @@ ffmpeg -y -i source.mp4 \
 ### 2026-04-08: 公開リリース + MECC v2.0.1移行 + コミュニティ参加
 - GitHub公開 (psp-pmdvis)
 - PSP homebrew Discord 参加初日で m-c/d + Acid_Snake に認識
-- m-c/dから「Tiny-MEじゃない、MECCだ」と指摘 → 即修正
+- m-c/dから現行名はMECCだと指摘 → 即修正
 - Acid_Snakeから「sepluginやめろ、RAM食う」→ auto-load方式に移行
 - v2.0.1 + 田中パッチ4点でリビルド → PSP Go実機確認
 - auto-load MECC完全動作確認 (embedded_kcall問題の根本原因特定)
@@ -572,8 +572,8 @@ ffmpeg -y -i source.mp4 \
 - **原因(仮説)**: .rodataとヒープのメモリ領域差
 
 ### MECC命名違反 (前科複数回)
-- **症状**: m-c/d から直接指摘 "it is not Tiny ME"
-- **原因**: Claudeが旧称「Tiny-ME」を使い続けた
+- **症状**: m-c/dから現行名への訂正を直接受けた
+- **原因**: Claudeが廃止済みの旧リポジトリ名を使い続けた
 - **修正**: psp-me-bench README日英 + コード全箇所
 
 ### ME OC PSP-3000フリーズ (2026-04-09)

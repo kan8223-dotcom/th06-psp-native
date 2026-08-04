@@ -9,6 +9,8 @@
 #ifdef __PSL1GHT__
 #include <cstring>
 #include <sys/mutex.h>
+#elif defined(TH06_PSP)
+#include <pspthreadman.h>
 #endif
 
 namespace std
@@ -30,6 +32,15 @@ class mutex
                 inited = true;
         }
     }
+#elif defined(TH06_PSP)
+    SceLwMutexWorkarea m{};
+    bool inited = false;
+
+    void ensure()
+    {
+        if (!inited && sceKernelCreateLwMutex(&m, "th06mtx", 0, 0, nullptr) >= 0)
+            inited = true;
+    }
 #endif
 
   public:
@@ -41,6 +52,10 @@ class mutex
         ensure();
         if (inited)
             sysMutexLock(m, 0); // 0 = no timeout
+#elif defined(TH06_PSP)
+        ensure();
+        if (inited)
+            sceKernelLockLwMutex(&m, 1, nullptr);
 #endif
     }
     void unlock()
@@ -48,6 +63,9 @@ class mutex
 #ifdef __PSL1GHT__
         if (inited)
             sysMutexUnlock(m);
+#elif defined(TH06_PSP)
+        if (inited)
+            sceKernelUnlockLwMutex(&m, 1);
 #endif
     }
     bool try_lock()
@@ -55,6 +73,9 @@ class mutex
 #ifdef __PSL1GHT__
         ensure();
         return inited && sysMutexTryLock(m) == 0;
+#elif defined(TH06_PSP)
+        ensure();
+        return inited && sceKernelTryLockLwMutex(&m, 1) >= 0;
 #else
         return true;
 #endif

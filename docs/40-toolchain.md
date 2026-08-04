@@ -122,5 +122,5 @@ PSP側のストレージprefixはコードで分岐する作法: `ef0:` が開�
 | `~/psp-moonlight` | 動画ストリーミング。PRXビルド + videocodec系 | `db8d792` 2026-04-11 |
 | `~/psp_me_bench`, `~/psp-444mhz-plugin`, `~/pmd_psp_fmp`, `~/pmd_psp_mecc` | 未調査 |
 
-MECCのビルド済みライブラリ実体: `~/pmd_psp/tiny-me/build/libme-core.a`、
+MECCのビルド済みライブラリ実体: `~/pmd_psp/me-custom-core/build/libme-core.a`、
 `~/psp-pmdvis-public/me-custom-core/build/libme-core.a`

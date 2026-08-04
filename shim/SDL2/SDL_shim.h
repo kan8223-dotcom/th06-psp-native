@@ -37,11 +37,16 @@ typedef enum
 #endif
 
 // ---------------------------------------------------------------- SDL_endian
-// PS3 PPC64 is big endian. Float word order matches integer order.
+// PS3 PPC64 is big endian; PSP Allegrex is little endian.
 #define SDL_LIL_ENDIAN 1234
 #define SDL_BIG_ENDIAN 4321
+#if defined(TH06_PSP) || defined(__MIPSEL__)
+#define SDL_BYTEORDER SDL_LIL_ENDIAN
+#define SDL_FLOATWORDORDER SDL_LIL_ENDIAN
+#else
 #define SDL_BYTEORDER SDL_BIG_ENDIAN
 #define SDL_FLOATWORDORDER SDL_BIG_ENDIAN
+#endif
 
 static inline constexpr Uint16 SDL_Swap16(Uint16 x)
 {
@@ -56,13 +61,22 @@ static inline constexpr Uint64 SDL_Swap64(Uint64 x)
     return __builtin_bswap64(x);
 }
 
-// On BE host: BE reads are identity, LE reads swap.
+// Keep the archive/audio byte-order helpers correct on both native targets.
+#if SDL_BYTEORDER == SDL_LIL_ENDIAN
+#define SDL_SwapBE16(x) SDL_Swap16(x)
+#define SDL_SwapBE32(x) SDL_Swap32(x)
+#define SDL_SwapBE64(x) SDL_Swap64(x)
+#define SDL_SwapLE16(x) (x)
+#define SDL_SwapLE32(x) (x)
+#define SDL_SwapLE64(x) (x)
+#else
 #define SDL_SwapBE16(x) (x)
 #define SDL_SwapBE32(x) (x)
 #define SDL_SwapBE64(x) (x)
 #define SDL_SwapLE16(x) SDL_Swap16(x)
 #define SDL_SwapLE32(x) SDL_Swap32(x)
 #define SDL_SwapLE64(x) SDL_Swap64(x)
+#endif
 
 // ---------------------------------------------------------------- SDL_rwops (functional, stdio-backed)
 #define RW_SEEK_SET 0
@@ -151,6 +165,13 @@ typedef struct SDL_Surface
     int pitch;
     void *pixels;
     int refcount;
+#ifdef TH06_PSP
+    // Platform-private identity for the PSP static-surface GE cache.  The
+    // engine still sees an ordinary SDL_Surface and never branches on this.
+    Uint32 pspSerial;
+    int pspSavedHeight;
+    int pspGeCached;
+#endif
 } SDL_Surface;
 
 typedef enum

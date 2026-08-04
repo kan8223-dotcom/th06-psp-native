@@ -8,11 +8,15 @@
 | # | 文書 | 中身 | 誰が書いたか |
 |---|---|---|---|
 | 1 | `10-th06-engine.md` | **TH06エンジンの構造と、PS3移植で判ったこと** | 母艦の書き下ろし (PS3移植の当事者記録) |
-| 2 | `40-toolchain.md` | 母艦のPSP開発環境の実態 (SDK・Makefile定型・憲兵・デプロイ経路・PPSSPP) | 2026-08-03に実地調査したもの |
-| 3 | `31-psp-scars.md` | **PSP開発の前科集**。短い。着手前に必ず読め | 母艦のfeedback記憶をそのまま |
-| 4 | `20-psp-hardware.md` | PSPハード知見 (Tachyon/eDRAM/ME/MECC/機種差/実戦Tips) 1100行 | 知識ベースのコピー (**stale**) |
-| 5 | `30-psp-sdk-knowledge.md` | PSP SDK/homebrew実戦知見 (sceMpeg・CFW差異・デバッグ記録) 600行 | 知識ベースのコピー (**stale**) |
-| 6 | `21-psp-me.md` | Media Engine 詳細。**TH06移植では当面不要** | 知識ベースのコピー (**stale**) |
+| 2 | `11-psp-backend-design.md` | **TH06 PSP backendの設計基準** (GU、音声、MECC、検証ゲート) | 2026-08-04書き下ろし |
+| 3 | `40-toolchain.md` | 母艦のPSP開発環境の実態 (SDK・Makefile定型・憲兵・デプロイ経路・PPSSPP) | 2026-08-03に実地調査したもの |
+| 4 | `31-psp-scars.md` | **PSP開発の前科集**。短い。着手前に必ず読め | 母艦のfeedback記憶をそのまま |
+| 5 | `20-psp-hardware.md` | PSPハード知見 (Tachyon/eDRAM/ME/MECC/機種差/実戦Tips) 1100行 | 知識ベースのコピー (**stale**) |
+| 6 | `30-psp-sdk-knowledge.md` | PSP SDK/homebrew実戦知見 (sceMpeg・CFW差異・デバッグ記録) 600行 | 知識ベースのコピー (**stale**) |
+| 7 | `21-psp-me.md` | Media Engine 詳細。PMDVISの実績と`11`を優先して引く | 知識ベースのコピー (**stale**) |
+| 8 | `50-validation.md` | 実行検証の事実記録（PPSSPPと実機を混同しない） | PSP移植作業記録 |
+| 9 | `12-me-audio-design.md` | PSPPMD実績を使うME音声ワーカー、SC fallback、timeoutの設計契約 | 2026-08-04実機計測後 |
+| 9 | `51-boot-diagnostics.md` | **起動診断の読み方**。実機が止まった時に最初に開くもの | 2026-08-04 母艦 |
 
 4〜6は通読するものではない。**引く**もの。着手前とハマった時に `grep` しろ。
 

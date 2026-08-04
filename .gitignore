@@ -5,4 +5,26 @@ obj/
 *.prx
 EBOOT.PBP
 PARAM.SFO
+/ICON0.PNG
 build/
+dist/
+backups/
+
+# Generated PSP binaries and local diagnostic artifacts.
+*.PBP
+*.PSP
+*.prx
+TH06PSP_BOOT*.LOG
+
+# Original TH06 and user data must never enter the public repository.
+th6/
+bgm/
+紅魔郷*.DAT
+TH06*.DAT
+*.wav
+*.rpy
+*.sf2
+score.dat
+東方紅魔郷.cfg
+TH06.CFG
+msgothic.ttc
