@@ -617,6 +617,10 @@ extern "C" void th06_wrap_copy_surface_rect(AnmManager *manager, long surfaceIdx
                                                long rectLeft, long rectTop, long rectWidth, long rectHeight)
     asm("__wrap__ZN10AnmManager27CopySurfaceRectToBackBufferElllllll");
 
+extern "C" void th06_wrap_copy_surface(AnmManager *manager, long surfaceIdx, long srcX, long srcY,
+                                         long dstX, long dstY)
+    asm("__wrap__ZN10AnmManager23CopySurfaceToBackBufferElllll");
+
 extern "C" void th06_wrap_copy_surface_rect(AnmManager *manager, long surfaceIdx, long dstX, long dstY,
                                                long rectLeft, long rectTop, long rectWidth, long rectHeight)
 {
@@ -693,6 +697,27 @@ extern "C" void th06_wrap_copy_surface_rect(AnmManager *manager, long surfaceIdx
     manager->SetCurrentTexture(0);
     manager->SetCurrentBlendMode(0xff);
     originalViewport.Set();
+}
+
+// CopySurfaceToBackBuffer and CopySurfaceRectToBackBuffer live in the same
+// engine translation unit.  GNU ld --wrap cannot redirect the former's local
+// call to the latter, so callers such as ResultScreen otherwise reach the
+// inherited ApplySurfaceToColorBuffer path and allocate a redundant
+// 640x480x3 copy every frame.  Route the public full-surface entry point to the
+// PSP direct-upload implementation as well.
+extern "C" void th06_wrap_copy_surface(AnmManager *manager, long surfaceIdx, long srcX, long srcY,
+                                         long dstX, long dstY)
+{
+    if (manager == nullptr || surfaceIdx < 0 ||
+        static_cast<unsigned long>(surfaceIdx) >= sizeof(manager->surfaces) / sizeof(manager->surfaces[0]))
+        return;
+
+    SDL_Surface *source = manager->surfaces[surfaceIdx];
+    if (source == nullptr)
+        return;
+
+    th06_wrap_copy_surface_rect(manager, surfaceIdx, dstX, dstY, srcX, srcY,
+                                 source->w - srcX, source->h - srcY);
 }
 
 extern "C" void th06_real_play_sfx(SoundPlayer *player, SoundIdx idx)

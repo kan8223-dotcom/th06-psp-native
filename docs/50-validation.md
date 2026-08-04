@@ -706,3 +706,23 @@ NaNをGEへ渡さないため削除しない。
   G:は最初の配達中にmedia disconnectしたが、C:へ退避した同一EBOOTを`EBOOT.NEW`へ全量copyし、
   SHA-256一致後に`EBOOT.PBP`へ置換して復旧した。G:上の3,015,542 bytesと上記SHA-256は一致。
   3D背景/BGM/resultの本版による実機確認は未完了。
+
+## V-028 result全面描画OOMとBGM補充priority (2026-08-05)
+
+- PSP実機でContinue「No」を選んだrunは、GameManager teardown、`result.jpg`、`result00..03.anm`、
+  `RESULT REGISTER END R0`まで全て通過した直後、`CXX OOM REQ921600B PC088089A4`でXMBへ戻った。
+  `0x088089A4`は最終ELFで`AnmManager::ExtractSurfacePixels()`内の`new[]`直後であり、要求量は
+  640x480xRGB24と一致する。ResultScreenが呼ぶ`CopySurfaceToBackBuffer()`は同じengine object内から
+  矩形helperを呼ぶため、既存の矩形helperだけのGNU ld wrapperを迂回していた。
+- `src/`は変更せず、全面helperもPSP wrapperから既存のGE直接uploadへ渡す。最終ELFの
+  `ResultScreen::OnDraw()`は`__wrap__...CopySurfaceToBackBuffer`をcallしており、900KiBの一時複製を
+  通らない。田中の実機確認でPSP-3000とPSP-1000の両方がContinue「No」から落ちなくなった。
+- 同じ実機記録は2,820.672秒でBGM read 7,580回、平均間隔372.1msだった。44.1kHz stereo s16の
+  64KiB消費周期371.5msと一致する一方、marker無効のため5秒周期`PERF/RUN/AUD`書込みは0行だった。
+  定常補充threadがpriority `0x1c`でmain `0x20`を毎回横取りしていたため、初期window充填後は
+  `0x21`へ下げ、実際のcache miss時だけ`0x1c`へ戻す。384KiB先読み量とME/SC fallbackは変えない。
+- 修正版をPSPへ配達後、田中の実機所感は音切れなし、表示FPSは「60張り付き近い」。これは厳密な
+  frame-time採取ではないため60fps達成値とは扱わず、周期stutter低減の実機確認とする。
+  通常EBOOTは3,015,734 bytes、SHA-256
+  `bd643ddd9131f1db74b7d4cab14dad310c796149789bd98e9ad1ccd4f6639d8d`。preflight違反0/警告0、
+  release auditは原作data/replay/score/test marker混入0件で、G:上のhashも一致した。

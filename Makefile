@@ -116,6 +116,7 @@ LIBS := -L$(MECC_BUILD_DIR) -lme-core \
         -Wl,--wrap=_ZN13EffectManager14SpawnParticlesElPK7ZunVec3lm \
         -Wl,--wrap=_ZN13BulletManager14DespawnBulletsElb \
         -Wl,--wrap=_ZN12AsciiManager12CreatePopup1EPK7ZunVec3lm \
+        -Wl,--wrap=_ZN10AnmManager23CopySurfaceToBackBufferElllll \
         -Wl,--wrap=_ZN10AnmManager27CopySurfaceRectToBackBufferElllllll \
         -Wl,--wrap=_ZN11SoundPlayer14PlaySoundByIdxE8SoundIdx \
         -Wl,--wrap=_ZNK10EclManager10CallEclSubEP15EnemyEclContexts \

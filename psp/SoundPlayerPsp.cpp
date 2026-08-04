@@ -92,6 +92,15 @@ namespace
 constexpr u32 kBgmCacheFrames = 16 * 1024;
 constexpr int kBgmCacheBlockCount = 6;
 constexpr u32 kMaxMixSamples = 2048; // 1024 stereo frames per worker pass
+#ifdef TH06_PSP
+// PSP priorities become less urgent as the number increases.  Normal storage
+// refill must not preempt the game every 64 KiB (~372 ms); the six-block cache
+// gives it roughly two seconds of slack.  Startup and an actual cache miss may
+// temporarily outrank the game so audio still fails toward silence, not a
+// permanently drained read-ahead window.
+constexpr int kBgmIoUrgentPriority = 0x1c;
+constexpr int kBgmIoBackgroundPriority = 0x21;
+#endif
 
 struct BgmCacheBlock
 {
@@ -271,6 +280,12 @@ int BgmPrefetchThread(SceSize, void *)
                 __atomic_store_n(&block.state, BGM_CACHE_EMPTY, __ATOMIC_RELEASE);
             }
         }
+
+        // At track start the thread is created urgent and fills the initial
+        // four asynchronous blocks promptly.  Every steady-state wake runs
+        // below main afterwards, using GE/vblank sleep time instead of
+        // stealing a render frame at the 64 KiB refill cadence.
+        sceKernelChangeThreadPriority(sceKernelGetThreadId(), kBgmIoBackgroundPriority);
     }
     sceKernelExitThread(0);
     return 0;
@@ -286,9 +301,9 @@ bool StartBgmPrefetchThread()
         return false;
     __atomic_store_n(&gBgmPrefetchAlive, true, __ATOMIC_RELEASE);
     // PSP priorities increase numerically as urgency decreases.  Keep storage
-    // below the DAC (0x10) and mixer (0x18), but above the game main thread
-    // (0x20) so a draw-heavy frame cannot starve read-ahead indefinitely.
-    gBgmPrefetchThread = sceKernelCreateThread("th06_bgm_io", BgmPrefetchThread, 0x1c, 0x4000,
+    // Start urgent only long enough to establish the initial read-ahead
+    // window.  BgmPrefetchThread lowers itself after draining that batch.
+    gBgmPrefetchThread = sceKernelCreateThread("th06_bgm_io", BgmPrefetchThread, kBgmIoUrgentPriority, 0x4000,
                                                 PSP_THREAD_ATTR_USER, nullptr);
     if (gBgmPrefetchThread < 0 || sceKernelStartThread(gBgmPrefetchThread, 0, nullptr) < 0)
     {
@@ -383,7 +398,13 @@ int AcquireBgmBlock(u32 frame, u32 protectedBlocks)
         return index;
 
     if (BgmFillAlreadyQueued(frame))
+    {
+#ifdef TH06_PSP
+        if (gBgmPrefetchThread >= 0)
+            sceKernelChangeThreadPriority(gBgmPrefetchThread, kBgmIoUrgentPriority);
+#endif
         return -1;
+    }
 
     // A missed prefetch must never turn back into synchronous FAT I/O on the
     // mixer. Queue a safe block and let this pass emit silence for the missing
@@ -399,7 +420,13 @@ int AcquireBgmBlock(u32 frame, u32 protectedBlocks)
         }
     }
     if (replace >= 0)
+    {
+#ifdef TH06_PSP
+        if (gBgmPrefetchThread >= 0)
+            sceKernelChangeThreadPriority(gBgmPrefetchThread, kBgmIoUrgentPriority);
+#endif
         RequestBgmBlock(replace, frame);
+    }
     return -1;
 }
 

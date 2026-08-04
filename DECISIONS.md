@@ -295,9 +295,32 @@ PSP版は既存の192KiB×2 blockを増やさず、専用user threadが次block�
 一切行わず、未着時はそのpassの不足部分を無音にして要求だけをqueueする。曲切替はgenerationで旧要求を
 失効させ、MEへ渡したblockはjob完了まで上書き対象にしない。原作WAVはread-onlyのままである。
 
-WAVからMP3への実行時変換は採らない。PSPSDKのMP3 APIはdecoderでencoderではなく、MECC音声mixと
-同時使用するencoderの実機実績も無い。I/O停止の直接原因は圧縮率ではなくmixer上の同期readなので、
-まず責務分離で直す。
+WAVから圧縮streamへの実行時変換はこの段階では採らず、まず責務分離で直す。PSPSDK標準MP3 APIが
+decoderのみでも、既存homebrew encoderの移植は可能であり、技術的に不可能という判断ではない。
+PSP-1000で非同期readとpriority調整後も帯域起因の停止が残る場合は、原作WAVを変更せず一時圧縮fileを
+生成・破棄する案を再評価する。codec license、変換時間、ME側実装の実機確認はその時点の要件とする。
+
+## D-028: BGM I/Oは通常mainより低priority、cache miss時だけ緊急昇格する
+
+2026-08-05。六分割384KiB cacheは音切れを止めたが、64KiBを消費する約372msごとにMemory Stick lampと
+frame落ちが同期した。実機記録の2,820.672秒/7,580 read = 372.1msはPCM消費周期371.5msと一致し、
+周期diagnostic logは無効だった。原因はI/O worker `0x1c`がgame main `0x20`を定常的に横取りする設計である。
+
+workerは曲開始時だけ`0x1c`で最初のread-aheadを作り、batch完了後は`0x21`へ下げる。mixerが実際に
+cache missを観測した時だけ`0x1c`へ戻す。DAC `0x10`、mixer `0x18`、384KiB cache、原作WAV read-only、
+miss時の無音fallbackは維持する。これにより通常補充はmainのGE/vblank待ち時間を使い、描画frameを
+372ms周期で奪わない。
+
+## D-029: 全面surface helperもPSPのGE直接uploadへwrapする
+
+2026-08-05。ResultScreen登録後の実機OOMは921,600 bytes、呼出元は
+`AnmManager::ExtractSurfacePixels()`だった。既存PSP wrapperは矩形surface helperだけを差し替えていたが、
+全面helperから矩形helperへのcallは同じengine object内にありGNU ld `--wrap`の対象外だった。そのため
+result.jpgを保持するRGB24 surfaceとは別に、初回drawで同じ640x480x3を一時複製していた。
+
+全面helper自体をPSP wrapperへ追加し、矩形版と同じGE upload/cache pathへ渡す。`src/`は変更せず、
+crop、FULL STRETCH/4:3、surface lifetime、draw直前dcache公開契約を維持する。PSP-3000とPSP-1000の
+両方でContinue「No」後にOOMせず進むことを実機確認した。
 
 ## D-027: PSP描画backendはVFPU版libGUMを使う
 
