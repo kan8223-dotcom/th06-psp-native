@@ -252,3 +252,20 @@ PSP wrapperが`rectLeft/rectTop/rectWidth/rectHeight`からUVを作り、要求�
 libGU/libGUMを呼んでGE commandを生成する。これはGE native描画だが、GE registerの直接書込みではない。
 音声はm-c/dの現行`psp-media-engine-custom-core`（MECC）を介してMedia EngineへPCM mixを渡し、
 MEが利用できない場合やtimeout時はSC mixerへfallbackする。この二点をREADMEの特徴として明記する。
+
+## D-024: PSP-1000では静止surface cacheをGameManager登録前に退役させる
+
+2026-08-04。PSP-1000での停止報告に対し、既存logの`SYSMEM LEFT`は
+`PSP_HEAP_SIZE_KB`がnewlib heapを予約した後のkernel partition残量であり、process heapの
+空きではないと分離した。newlib `mallinfo()`によるheap snapshotと`std::new_handler`を追加し、
+実際のC++ OOMは残量をlog/画面に残してXMBへ戻す。周期的なMemory Stick書き込みは追加しない。
+
+GE backendの静止画resample cacheは1entry 512KiB、2entryをmenu/ending後も保持していた。
+GameManagerの同期登録境界でGE listを完了させ、生存textureが借用中のentryは残し、
+非借用entryだけを解放する。PPSSPPの32MB modelでstage 1登録時のtexture累計は
+3872KiBから3360KiB、heap使用量は14602KiBから14090KiBへ低下した。通常demo登録では
+1024KiBを解放し、その後title用cacheを再生成して次のdemo登録まで通過した。
+
+PSP-1000実機は同じ版でtitle demoを完走し、titleへ復帰後も継続動作した。
+Memory Stick lampと同期する短い停止は残っており、D-016で残件としたBGM同期readの
+非同期prefetch化として別に扱う。

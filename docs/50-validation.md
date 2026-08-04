@@ -633,3 +633,23 @@ NaNをGEへ渡さないため削除しない。
 - `release_audit.sh`と`psp_preflight.sh --post`は違反0・警告0。通常EBOOTに
   `PS3 REPLAY AUTO`、`STAGE SOAK`、`EXACT REPLAY TRACE`のtest-only markerは無い。
   廃止済みMECC repository名はsource、文書、配布ZIPの全てで0件。
+
+## V-024 PSP-1000 32MBでのheap観測とsurface cache退役 (2026-08-04)
+
+- 当初回収logはtitle/demo assetを読み、`T2208KB`まで通過していたが、
+  `GE TEX OOM`、`GE SURFACE OOM`、`CXX OOM`、watchdogのどれも無く、OOMと断定できなかった。
+  `sceKernelTotalFreeMemSize()`はnewlib heap外の残量だったため、`mallinfo()`のarena/used/free/
+  largest top chunk/free block数を起動と既存のasset境界logへ追加した。
+- PPSSPP v1.20.4の`PSPModel=0`（32MB）stage soakで、未退役版のstage 1は
+  `T3872KB H14602/187KB`、退役版は`T3360KB H14090KB`となり、512KiBを回収した。
+  通常title demoでは`X1024KB`を回収し、title復帰後の`GE SURFACE`再生成、次のdemoの
+  `X512KB`回収まで通過した。
+- PSP-1000実機へ3,006,710 bytes / SHA-256
+  `031da8db38e6d80eb57e7a00934c0943eef6d6484b7e0ce67684a6ab93bcc716`を配達後、田中の実機確認で
+  title demoからtitleへ戻り、引き続き動作した。PSP-3000より若干遅いとの観測がある。
+- Memory Stickのaccess lamp点灯と短い停止は同期して残る。通常版の周期logは無効のままであり、
+  現行BGM cacheは192KiB×2をmixer threadが同期補充する。以後のI/O分離は本validationと混ぜない。
+- 実機確認後のclean buildはEBOOT 3,006,710 bytes / SHA-256
+  `163e4e41a9a486e84a52d4e28b1b92668a9132a2c766308419ad12b785559525`、配布ZIPは
+  `1a33160f03668b9c22bb81eed242d37393eecf0f285435598cb77f5a938f3f49`。preflightは違反0・警告0、
+  release auditは原作data/replay/score/廃止済みMECC名の混入が0件だった。

@@ -15,6 +15,7 @@
 #include "AnmManager.hpp"
 #include "Supervisor.hpp"
 #include "diag.hpp"
+#include "memory.hpp"
 #include "video.hpp"
 
 namespace
@@ -98,6 +99,9 @@ struct SurfaceCacheEntry
 
 extern "C" unsigned int th06_psp_last_locked_surface_serial();
 extern "C" void th06_psp_mark_surface_ge_cached(unsigned int serial, int cached);
+
+class PspGuGfx;
+PspGuGfx *gPspGuBackend;
 
 unsigned int NextPowerOfTwo(unsigned int value)
 {
@@ -187,6 +191,8 @@ class PspGuGfx final : public GfxInterface
 
     ~PspGuGfx() override
     {
+        if (gPspGuBackend == this)
+            gPspGuBackend = nullptr;
         if (mListOpen)
         {
             sceGuFinish();
@@ -588,8 +594,11 @@ class PspGuGfx final : public GfxInterface
             if (!texture.pixels)
             {
                 mError = true;
-                th06_psp_boot_notef("GE TEX OOM %ux%u %uB RAM%uKB", static_cast<unsigned int>(width),
-                                    static_cast<unsigned int>(height), bytes, mTextureBytes / 1024u);
+                const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+                th06_psp_boot_notef("GE TEX OOM %ux%u %uB T%uKB H%u/%u/%uKB",
+                                    static_cast<unsigned int>(width), static_cast<unsigned int>(height), bytes,
+                                    mTextureBytes / 1024u, heap.usedBytes / 1024u, heap.freeBytes / 1024u,
+                                    heap.topFreeBytes / 1024u);
                 return;
             }
             if (traceRuntimeAllocation)
@@ -745,6 +754,65 @@ class PspGuGfx final : public GfxInterface
             }
             std::memcpy(destination + row * width * 4, base + (sourceY * kBufferWidth + x) * 4, width * 4);
         }
+    }
+
+    unsigned int TrimSurfaceCache()
+    {
+        bool hasUnborrowedEntry = false;
+        for (int cacheIndex = 0; cacheIndex < kSurfaceCacheEntries; ++cacheIndex)
+        {
+            const SurfaceCacheEntry &entry = mSurfaceCache[cacheIndex];
+            if (!entry.valid || !entry.pixels)
+                continue;
+            bool borrowed = false;
+            for (int textureIndex = 1; textureIndex < kMaxTextures; ++textureIndex)
+            {
+                if (mTextures[textureIndex].used && mTextures[textureIndex].borrowedSurfaceCache &&
+                    mTextures[textureIndex].pixels == entry.pixels)
+                {
+                    borrowed = true;
+                    break;
+                }
+            }
+            if (!borrowed)
+            {
+                hasUnborrowedEntry = true;
+                break;
+            }
+        }
+        if (!hasUnborrowedEntry)
+            return 0;
+
+        // The registration boundary is between rendered frames, but finish
+        // the currently open direct list before revoking any GE-visible RAM.
+        SubmitAndRestart();
+
+        unsigned int freed = 0;
+        for (int cacheIndex = 0; cacheIndex < kSurfaceCacheEntries; ++cacheIndex)
+        {
+            SurfaceCacheEntry &entry = mSurfaceCache[cacheIndex];
+            if (!entry.valid || !entry.pixels)
+                continue;
+            bool borrowed = false;
+            for (int textureIndex = 1; textureIndex < kMaxTextures; ++textureIndex)
+            {
+                if (mTextures[textureIndex].used && mTextures[textureIndex].borrowedSurfaceCache &&
+                    mTextures[textureIndex].pixels == entry.pixels)
+                {
+                    borrowed = true;
+                    break;
+                }
+            }
+            if (borrowed)
+                continue;
+            if (entry.surfaceSerial != 0)
+                th06_psp_mark_surface_ge_cached(entry.surfaceSerial, 0);
+            freed += entry.bytes;
+            mTextureBytes -= entry.bytes;
+            std::free(entry.pixels);
+            entry = SurfaceCacheEntry{};
+        }
+        return freed;
     }
 
     void Draw(PrimitiveType type, i32 start, i32 count) override
@@ -1139,7 +1207,10 @@ class PspGuGfx final : public GfxInterface
                     entry->bytes = 0;
                     entry->valid = false;
                     mError = true;
-                    th06_psp_boot_notef("GE SURFACE CACHE OOM %uB", texture.bytes);
+                    const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+                    th06_psp_boot_notef("GE SURFACE OOM %uB T%uKB H%u/%u/%uKB", texture.bytes,
+                                        mTextureBytes / 1024u, heap.usedBytes / 1024u,
+                                        heap.freeBytes / 1024u, heap.topFreeBytes / 1024u);
                     return;
                 }
                 entry->bytes = texture.bytes;
@@ -1216,9 +1287,11 @@ class PspGuGfx final : public GfxInterface
             }
             sceKernelDcacheWritebackRange(entry->pixels, entry->bytes);
             sceGuTexFlush();
-            th06_psp_boot_notef("GE SURFACE %ux%u>%ux%u P%uKB", static_cast<unsigned int>(contentWidth),
-                                static_cast<unsigned int>(contentHeight), dstWidth, dstHeight,
-                                entry->bytes / 1024);
+            const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+            th06_psp_boot_notef("GE SURFACE %ux%u>%ux%u P%uKB T%uKB H%u/%uKB",
+                                static_cast<unsigned int>(contentWidth), static_cast<unsigned int>(contentHeight),
+                                dstWidth, dstHeight, entry->bytes / 1024u, mTextureBytes / 1024u,
+                                heap.usedBytes / 1024u, heap.freeBytes / 1024u);
             if (surfaceSerial != 0)
                 th06_psp_mark_surface_ge_cached(surfaceSerial, 1);
         }
@@ -1460,5 +1533,11 @@ GfxInterface *Th06CreatePspGuBackend()
         delete backend;
         return nullptr;
     }
+    gPspGuBackend = backend;
     return backend;
+}
+
+extern "C" unsigned int th06_psp_ge_trim_surface_cache()
+{
+    return gPspGuBackend ? gPspGuBackend->TrimSurfaceCache() : 0u;
 }

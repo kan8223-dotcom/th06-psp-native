@@ -1,6 +1,7 @@
 #include "platform_hooks.hpp"
 
 #include "diag.hpp"
+#include "memory.hpp"
 
 #include <pspkernel.h>
 #include <cmath>
@@ -22,6 +23,7 @@
 #include "GameManager.hpp"
 #include "GameWindow.hpp"
 #include "Gui.hpp"
+#include "graphics/PspGuGfx.hpp"
 #include "ItemManager.hpp"
 #include "MainMenu.hpp"
 #include "Player.hpp"
@@ -400,8 +402,9 @@ extern "C" unsigned int th06_wrap_gui_update(Gui *gui)
     if (before != SUPERVISOR_STATE_GAMEMANAGER_REINIT &&
         g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER_REINIT)
     {
-        th06_psp_boot_notef("STAGE END SIGNAL OLD%ld S%ldKB", g_GameManager.currentStage,
-                            CurrentStackFreeKb());
+        const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+        th06_psp_boot_notef("STAGE END SIGNAL OLD%ld S%ldKB H%u/%uKB", g_GameManager.currentStage,
+                            CurrentStackFreeKb(), heap.usedBytes / 1024u, heap.freeBytes / 1024u);
         th06_psp_runtime_progress();
     }
     return result;
@@ -807,6 +810,10 @@ extern "C" long th06_wrap_game_manager_register() asm("__wrap__ZN11GameManager13
 
 extern "C" long th06_wrap_game_manager_register()
 {
+    // Menu/ending still images use two persistent 512 KiB resample caches.
+    // GameManager registration is a synchronous ownership boundary: retire
+    // entries no live texture borrows before stage assets need the RAM.
+    const unsigned int surfaceCacheFreed = th06_psp_ge_trim_surface_cache();
     const bool stageReinitAttempt = g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER_REINIT;
     const bool stageReinit = __atomic_load_n(&gStageReinitTrace, __ATOMIC_ACQUIRE) != 0;
     if (stageReinit)
@@ -839,8 +846,10 @@ extern "C" long th06_wrap_game_manager_register()
     if (gDemoLoadStartUs != 0)
     {
         const unsigned int elapsedMs = (sceKernelGetSystemTimeLow() - gDemoLoadStartUs) / 1000u;
-        th06_psp_boot_notef("DEMO LOAD END %ums A%u %uKB", elapsedMs, gDemoAssetCount,
-                            gDemoAssetBytes / 1024u);
+        const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+        th06_psp_boot_notef("DEMO LOAD END %ums A%u %uKB X%uKB H%u/%uKB", elapsedMs, gDemoAssetCount,
+                            gDemoAssetBytes / 1024u, surfaceCacheFreed / 1024u,
+                            heap.usedBytes / 1024u, heap.freeBytes / 1024u);
         gDemoLoadStartUs = 0;
     }
     if (stageReinit)
@@ -854,7 +863,9 @@ extern "C" long th06_wrap_game_manager_register()
         // One durable result is enough in the normal build.  The dozens of
         // phase records are available only with TH06PSP_DIAG.ON so ordinary
         // stage changes do not fight BGM reads on the Memory Stick.
-        th06_psp_boot_notef("STAGE REINIT RESULT R%ld NOW%ld", result, g_GameManager.currentStage);
+        const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+        th06_psp_boot_notef("STAGE REINIT RESULT R%ld NOW%ld H%u/%uKB", result,
+                            g_GameManager.currentStage, heap.usedBytes / 1024u, heap.freeBytes / 1024u);
     }
     return result;
 }

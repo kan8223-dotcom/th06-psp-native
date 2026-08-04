@@ -16,7 +16,7 @@ ENGINE_SRCS += src/midi/MidiDefault.cpp
 # The boot diagnostics (on-screen boot log, exception dump, boot watchdog,
 # escape combo) are in both configurations on purpose: the probe is where the
 # safety net itself gets tested before the body has to rely on it.
-DIAG_SRCS := psp/video.cpp psp/fileio.cpp psp/diag.cpp psp/text.cpp
+DIAG_SRCS := psp/video.cpp psp/fileio.cpp psp/diag.cpp psp/text.cpp psp/memory.cpp
 ifeq ($(BOOT_PROBE),1)
 SRCS := psp/main.cpp $(DIAG_SRCS)
 else

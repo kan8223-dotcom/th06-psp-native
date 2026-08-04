@@ -65,6 +65,10 @@ extern "C"
     // executes outside callback context.
     void th06_psp_request_exit(int reason);
 
+    // Fatal paths that still have a functioning kernel can leave a readable
+    // screen and return to XMB without relying on the engine or GE.
+    void th06_psp_fatal_exit(const char *title, const char *detail);
+
 }
 
 // Why there is no CPU exception dump here: pspDebugInstallErrorHandler needs

@@ -5,6 +5,7 @@
 #include "Supervisor.hpp"
 #include "diag.hpp"
 #include "i18n.hpp"
+#include "memory.hpp"
 #include "utils.hpp"
 
 #include <SDL2/SDL.h>
@@ -348,6 +349,7 @@ ZunResult SoundPlayer::LoadWav(const char *path)
     u32 riffSize;
     u32 wavDataSize;
     u32 dataOffset;
+    Th06PspHeapSnapshot heap;
 
     if (this->audioDev == 0)
     {
@@ -492,8 +494,11 @@ ZunResult SoundPlayer::LoadWav(const char *path)
     this->backgroundMusic.pos = 0;
     this->soundBufMutex.unlock();
 
-    th06_psp_boot_notef("BGM OPEN %s %luKB C%luKB", path, static_cast<unsigned long>(wavDataSize / 1024),
-                        static_cast<unsigned long>(sizeof(gBgmStream.blocks) / 1024));
+    heap = th06_psp_heap_snapshot();
+    th06_psp_boot_notef("BGM OPEN %s %luKB C%luKB H%u/%uKB", path,
+                        static_cast<unsigned long>(wavDataSize / 1024),
+                        static_cast<unsigned long>(sizeof(gBgmStream.blocks) / 1024),
+                        heap.usedBytes / 1024u, heap.freeBytes / 1024u);
 
     return ZUN_SUCCESS;
 

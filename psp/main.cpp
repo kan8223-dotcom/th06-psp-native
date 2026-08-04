@@ -11,6 +11,7 @@
 
 #include "diag.hpp"
 #include "fileio.hpp"
+#include "memory.hpp"
 #include "video.hpp"
 
 PSP_MODULE_INFO("TH06 PSP bootstrap", 0, 1, 0);
@@ -75,6 +76,10 @@ void RecordBootHeader()
     th06_psp_boot_notef("SYSMEM LEFT %uKB MAXBLOCK %uKB",
                         static_cast<unsigned int>(sceKernelTotalFreeMemSize() / 1024),
                         static_cast<unsigned int>(sceKernelMaxFreeMemSize() / 1024));
+    const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+    th06_psp_boot_notef("HEAP A%uKB U%uKB F%uKB TOP%uKB B%u", heap.arenaBytes / 1024u,
+                        heap.usedBytes / 1024u, heap.freeBytes / 1024u, heap.topFreeBytes / 1024u,
+                        heap.freeBlocks);
 }
 
 #if !defined(TH06_PSP_BOOT_PROBE)
@@ -127,6 +132,7 @@ int main(int argc, char **argv)
     th06_psp_video_init();
     th06_psp_video_fill(0xff202020u);
     th06_psp_fileio_init();
+    th06_psp_install_oom_handler();
 
     InstallCallbacks();
     th06_psp_escape_start();

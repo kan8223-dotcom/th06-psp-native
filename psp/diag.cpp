@@ -352,3 +352,8 @@ extern "C" void th06_psp_request_exit(int reason)
     int expected = 0;
     __atomic_compare_exchange_n(&gExitRequested, &expected, reason, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
+
+extern "C" void th06_psp_fatal_exit(const char *title, const char *detail)
+{
+    ExitToXmbAfterNotice(title ? title : "FATAL ERROR", detail ? detail : "UNKNOWN");
+}
