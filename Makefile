@@ -112,6 +112,7 @@ LIBS := -L$(MECC_BUILD_DIR) -lme-core \
         -Wl,--wrap=_ZN13EffectManager8CutChainEv \
         -Wl,--wrap=_ZN3Gui8CutChainEv \
         -Wl,--wrap=_ZN13ReplayManager13StopRecordingEv \
+        -Wl,--wrap=_ZN13ReplayManager10SaveReplayEPKcPc \
         -Wl,--wrap=_ZN5Stage13RegisterChainEm \
         -Wl,--wrap=_ZN6Player13RegisterChainEh \
         -Wl,--wrap=_ZN13BulletManager13RegisterChainEPKc \

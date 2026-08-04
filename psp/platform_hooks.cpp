@@ -59,6 +59,7 @@ volatile unsigned int gBulletRenderMath;
 volatile unsigned int gBulletFastDraws;
 volatile unsigned int gBulletFallbackDraws;
 unsigned int gReplayCompactedBytes;
+StageReplayData *gReplayStoppedStages[7];
 
 // Real-hardware stage changes used to stop in EclManager::Unload(), inside
 // one of the two newlib free() calls.  ECL data is immutable after Load(), and
@@ -1394,10 +1395,27 @@ extern "C" void th06_wrap_stop_replay()
         th06_psp_boot_note("stop_replay BEGIN");
 
     gReplayCompactedBytes = 0;
-    th06_real_stop_replay();
-
     ReplayManager *manager = g_ReplayManager;
     const int stageIndex = g_GameManager.currentStage - 1;
+    StageReplayData *stageBefore = nullptr;
+    if (manager != nullptr && !manager->IsDemo() && manager->replayData != nullptr && stageIndex >= 0 &&
+        stageIndex < 7)
+    {
+        stageBefore = manager->replayData->stageReplayData[stageIndex];
+        // Game teardown terminates this stage before the result screen.
+        // SaveReplay terminates it again after name entry. The first PSP call
+        // has already realloc-shrunk the buffer, so the second terminator pair
+        // would be written beyond the real allocation while the engine's
+        // sizeof-based bound still appears valid.
+        if (stageBefore != nullptr && gReplayStoppedStages[stageIndex] == stageBefore)
+        {
+            th06_psp_boot_notef("REPLAY STOP SKIP ST%d", stageIndex + 1);
+            return;
+        }
+    }
+
+    th06_real_stop_replay();
+
     if (manager != nullptr && !manager->IsDemo() && manager->replayData != nullptr && stageIndex >= 0 &&
         stageIndex < 7)
     {
@@ -1428,6 +1446,10 @@ extern "C" void th06_wrap_stop_replay()
                         gReplayCompactedBytes = sizeof(StageReplayData) - usedBytes;
                     }
                 }
+
+                // Remember the relocated pointer too. This also makes the
+                // operation idempotent when realloc could not shrink it.
+                gReplayStoppedStages[stageIndex] = manager->replayData->stageReplayData[stageIndex];
             }
         }
     }
@@ -1601,10 +1623,25 @@ extern "C" long th06_wrap_replay_register(long demo, const char *path)
     asm("__wrap__ZN13ReplayManager13RegisterChainElPKc");
 extern "C" long th06_wrap_replay_register(long demo, const char *path)
 {
+    const bool newRecordingSession = g_ReplayManager == nullptr && demo == 0;
     TH06_TRACE_STAGE_REGISTER_BEGIN("ADD REPLAY");
     const long result = th06_real_replay_register(demo, path);
+    if (newRecordingSession)
+        std::memset(gReplayStoppedStages, 0, sizeof(gReplayStoppedStages));
     TH06_TRACE_STAGE_REGISTER_END("ADD REPLAY", result);
     return result;
+}
+
+extern "C" void th06_real_save_replay(const char *path, char *name)
+    asm("__real__ZN13ReplayManager10SaveReplayEPKcPc");
+extern "C" void th06_wrap_save_replay(const char *path, char *name)
+    asm("__wrap__ZN13ReplayManager10SaveReplayEPKcPc");
+
+extern "C" void th06_wrap_save_replay(const char *path, char *name)
+{
+    th06_psp_boot_notef("REPLAY SAVE BEGIN %s", path != nullptr ? path : "(null)");
+    th06_real_save_replay(path, name);
+    th06_psp_boot_note("REPLAY SAVE END");
 }
 
 #undef TH06_TRACE_STAGE_REGISTER_BEGIN
@@ -1712,6 +1749,8 @@ extern "C" unsigned int th06_psp_real_player_update(Player *player)
 extern "C" unsigned int th06_psp_player_update(Player *player)
 {
     StabilizeReimuAHomingBullets(player);
+    const int playerStateBefore =
+        player != nullptr ? static_cast<int>(player->playerState) : static_cast<int>(PLAYER_STATE_ALIVE);
 #if defined(TH06_PSP_REPLAY_TRACE)
     // Bounded snapshots make the captured input timeline comparable between
     // PPSSPP and hardware without turning the 60 Hz path into FAT I/O.
@@ -1771,7 +1810,25 @@ extern "C" unsigned int th06_psp_player_update(Player *player)
     }
 #endif
 #endif
-    return th06_psp_real_player_update(player);
+    const unsigned int result = th06_psp_real_player_update(player);
+
+    // A surviving player always respawns with the configured bomb stock.
+    // Reassert that engine invariant at the PSP boundary and force the HUD to
+    // redraw it; this is one event per death, not a frame-loop log.
+    if (player != nullptr && playerStateBefore == PLAYER_STATE_DEAD &&
+        player->playerState == PLAYER_STATE_SPAWNING && !g_GameManager.isInRetryMenu)
+    {
+        const int restoredBombs =
+            (g_GameManager.difficulty < EXTRA && !g_GameManager.isInPracticeMode)
+                ? static_cast<int>(g_Supervisor.defaultConfig.bombCount)
+                : 3;
+        const int bombsBeforeRepair = g_GameManager.bombsRemaining;
+        g_GameManager.bombsRemaining = static_cast<i8>(restoredBombs);
+        g_Gui.flags.flag1 = 2;
+        th06_psp_boot_notef("RESPAWN BOMBS %d>%d", bombsBeforeRepair, restoredBombs);
+    }
+
+    return result;
 }
 
 #if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_RESULT_SOAK) || \
