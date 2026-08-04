@@ -47,6 +47,13 @@ extern "C"
     // run; boot, transition and failure notes remain recorded regardless.
     int th06_psp_periodic_diag_enabled();
 
+    // Audio telemetry is sampled into a RAM flight recorder.  Normal gameplay
+    // never writes it to the Memory Stick.  Transition/failure wrappers may
+    // emit one compact checkpoint; `always == 0` suppresses the write when the
+    // interval contains no underrun, producer/I/O stall, cache miss, drop or
+    // ME timeout.
+    void th06_psp_audio_diag_checkpoint(const char *tag, int always);
+
     // -------------------------------------------------------------- watchdog
     // Boot only.  A boot that stops making progress reports its last note and
     // returns to the XMB instead of forcing a hardware shutdown.

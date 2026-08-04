@@ -29,8 +29,10 @@
 #include "MainMenu.hpp"
 #include "Player.hpp"
 #include "ReplayManager.hpp"
+#include "ResultScreen.hpp"
 #include "SoundPlayer.hpp"
 #include "Supervisor.hpp"
+#include "i18n.hpp"
 #include "pbg3/Pbg3Archive.hpp"
 
 extern ReplayManager *g_ReplayManager;
@@ -43,6 +45,7 @@ unsigned int gDemoLoadStartUs;
 unsigned int gDemoAssetCount;
 unsigned int gDemoAssetBytes;
 volatile unsigned int gStageReinitTrace;
+volatile unsigned int gResultTransitionTrace;
 volatile unsigned int gBossDeathTraceFrames;
 unsigned long long gPerfCalcUs;
 unsigned long long gPerfDrawUs;
@@ -95,11 +98,17 @@ bool BossDeathTraceArmingEnabled()
 
 bool DetailedStageTransitionTracing()
 {
-#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_RESULT_SOAK)
     return true;
 #else
     return th06_psp_periodic_diag_enabled() != 0;
 #endif
+}
+
+bool GameTeardownTracing()
+{
+    return __atomic_load_n(&gStageReinitTrace, __ATOMIC_ACQUIRE) != 0 ||
+           __atomic_load_n(&gResultTransitionTrace, __ATOMIC_ACQUIRE) != 0;
 }
 
 // Reimu A's homing update divides by the length of its newly steered velocity.
@@ -182,6 +191,8 @@ extern "C" void th06_breadcrumb(const char *msg)
 extern "C" void *__real__Znwj(unsigned int bytes);
 extern "C" void *__wrap__Znwj(unsigned int bytes)
 {
+    th06_psp_note_new_request(bytes, static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(
+                                              __builtin_return_address(0))));
     static bool tracing;
     // Asset setup after the title screen is the first substantial allocation
     // burst on PSP.  Keep the old 1 MiB boot threshold, but retain 64 KiB+
@@ -245,6 +256,7 @@ extern "C" u8 *th06_wrap_pbg3_read(Pbg3Archive *archive, unsigned long entryIdx,
 {
     const bool runtime = !th06_psp_boot_phase();
     const bool verbose = th06_psp_verbose_transition_diag() != 0;
+    const bool resultTrace = __atomic_load_n(&gResultTransitionTrace, __ATOMIC_ACQUIRE) != 0;
     const unsigned long expected = archive ? archive->GetEntrySize(entryIdx) : 0;
     const unsigned int start = sceKernelGetSystemTimeLow();
     if (runtime && filename && std::strcmp(filename, "demo00.rpy") == 0)
@@ -261,7 +273,7 @@ extern "C" u8 *th06_wrap_pbg3_read(Pbg3Archive *archive, unsigned long entryIdx,
         ++gDemoAssetCount;
         gDemoAssetBytes += static_cast<unsigned int>(expected);
     }
-    if (runtime && verbose)
+    if (runtime && (verbose || resultTrace))
     {
         th06_psp_runtime_progress();
         th06_psp_boot_notef("ARC BEGIN %s %luKB", filename ? filename : "?", expected / 1024u);
@@ -269,7 +281,7 @@ extern "C" u8 *th06_wrap_pbg3_read(Pbg3Archive *archive, unsigned long entryIdx,
     u8 *result = th06_real_pbg3_read(archive, entryIdx, filename);
     if (runtime)
         th06_psp_runtime_progress();
-    if (runtime && verbose)
+    if (runtime && (verbose || resultTrace))
     {
         th06_psp_boot_notef("ARC END %s %s %ums", filename ? filename : "?", result ? "OK" : "NG",
                             (sceKernelGetSystemTimeLow() - start) / 1000u);
@@ -637,12 +649,19 @@ extern "C" void th06_wrap_copy_surface_rect(AnmManager *manager, long surfaceIdx
             result <<= 1;
         return result;
     };
-    const unsigned int textureWidth = bitCeil(static_cast<unsigned int>(source->w));
-    const unsigned int textureHeight = bitCeil(static_cast<unsigned int>(source->h));
+    const int sourceWidth = source->w;
+    const int sourceHeight = source->h;
+    const unsigned int textureWidth = bitCeil(static_cast<unsigned int>(sourceWidth));
+    const unsigned int textureHeight = bitCeil(static_cast<unsigned int>(sourceHeight));
     g_GfxBackend->SetTextureImage(textureWidth, textureHeight, PIXEL_RGB, PIXEL_UNSIGNED_BYTE, nullptr);
-    unsigned char *surfaceData = AnmManager::ExtractSurfacePixels(source, 3);
-    g_GfxBackend->SetTextureSubImage(0, 0, source->w, source->h, surfaceData);
-    delete[] surfaceData;
+    // PSP's RGB24 shim surfaces are tightly packed and remain alive for the
+    // complete synchronous upload.  Feed their pixels directly to the GE
+    // resampler instead of allocating and copying another 640x480x3 (900 KiB)
+    // staging buffer.  Lock also supplies the stable surface serial used by
+    // the GE cache; unlock restores the cached-surface height sentinel.
+    SDL_LockSurface(source);
+    g_GfxBackend->SetTextureSubImage(0, 0, sourceWidth, sourceHeight, source->pixels);
+    SDL_UnlockSurface(source);
 
     VertexTex1DiffuseXyz vertices[4];
     vertices[0].position = ZunVec3(static_cast<float>(dstX), static_cast<float>(dstY), 0.0f);
@@ -885,8 +904,13 @@ extern "C" void th06_wrap_game_manager_cut() asm("__wrap__ZN11GameManager8CutCha
 
 extern "C" void th06_wrap_game_manager_cut()
 {
-    const bool stageReinit = g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER_REINIT &&
-                             DetailedStageTransitionTracing();
+    const bool stageReinitAttempt = g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER_REINIT;
+    const bool stageReinit = stageReinitAttempt && DetailedStageTransitionTracing();
+    const bool resultTransition = g_Supervisor.curState == SUPERVISOR_STATE_RESULTSCREEN_FROMGAME;
+    if (resultTransition)
+        th06_psp_audio_diag_checkpoint("CONTNO", 1);
+    else if (stageReinitAttempt)
+        th06_psp_audio_diag_checkpoint("STAGE", 0);
     if (stageReinit)
     {
         __atomic_store_n(&gStageReinitTrace, 1, __ATOMIC_RELEASE);
@@ -896,12 +920,118 @@ extern "C" void th06_wrap_game_manager_cut()
         th06_psp_boot_notef("STAGE REINIT CUT BEGIN OLD%ld S%ldKB", g_GameManager.currentStage,
                             CurrentStackFreeKb());
     }
+    else if (resultTransition)
+    {
+        // A game-over reaches this boundary once, after BGM shutdown. Durable
+        // phase pairs are safe here and identify a hardware-only teardown
+        // fault without requiring another manual run to stage 5.
+        __atomic_store_n(&gResultTransitionTrace, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&gTransitionTraceMarkers, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&gTransitionTraceBudget, 3, __ATOMIC_RELEASE);
+        th06_psp_runtime_progress();
+        th06_psp_boot_notef("RESULT CUT BEGIN ST%ld S%ldKB", g_GameManager.currentStage,
+                            CurrentStackFreeKb());
+    }
     th06_real_game_manager_cut();
     if (stageReinit)
     {
         th06_psp_boot_notef("STAGE REINIT CUT END S%ldKB", CurrentStackFreeKb());
         th06_psp_runtime_progress();
     }
+    else if (resultTransition)
+    {
+        th06_psp_boot_notef("RESULT CUT END S%ldKB", CurrentStackFreeKb());
+        th06_psp_runtime_progress();
+    }
+}
+
+extern "C" long th06_real_result_screen_register(long fromGame)
+    asm("__real__ZN12ResultScreen13RegisterChainEl");
+extern "C" long th06_wrap_result_screen_register(long fromGame)
+    asm("__wrap__ZN12ResultScreen13RegisterChainEl");
+
+extern "C" long th06_wrap_result_screen_register(long fromGame)
+{
+    const bool trace = __atomic_load_n(&gResultTransitionTrace, __ATOMIC_ACQUIRE) != 0;
+    // Result registration is another synchronous surface-ownership boundary.
+    // Retire only cache entries whose SDL surfaces are already gone before
+    // result.jpg and its ANM atlases are allocated.
+    const unsigned int cacheFreed = th06_psp_ge_trim_surface_cache();
+    if (trace)
+    {
+        const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+        th06_psp_boot_notef("RESULT REGISTER BEGIN F%ld X%uKB H%u/%uKB S%ldKB", fromGame,
+                            cacheFreed / 1024u, heap.usedBytes / 1024u, heap.freeBytes / 1024u,
+                            CurrentStackFreeKb());
+        th06_psp_runtime_progress();
+    }
+
+    const long result = th06_real_result_screen_register(fromGame);
+    if (trace)
+    {
+        const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+        th06_psp_boot_notef("RESULT REGISTER END R%ld H%u/%uKB S%ldKB", result,
+                            heap.usedBytes / 1024u, heap.freeBytes / 1024u, CurrentStackFreeKb());
+        th06_psp_runtime_progress();
+        __atomic_store_n(&gResultTransitionTrace, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&gTransitionTraceBudget, 0, __ATOMIC_RELEASE);
+    }
+    return result;
+}
+
+extern "C" long th06_real_anm_load_surface(AnmManager *manager, long index, const char *path)
+    asm("__real__ZN10AnmManager11LoadSurfaceElPKc");
+extern "C" long th06_wrap_anm_load_surface(AnmManager *manager, long index, const char *path)
+    asm("__wrap__ZN10AnmManager11LoadSurfaceElPKc");
+extern "C" SDL_Surface *th06_psp_img_load_jpeg_rgb24(const unsigned char *data, std::size_t size);
+
+extern "C" long th06_wrap_anm_load_surface(AnmManager *manager, long index, const char *path)
+{
+    const bool trace = __atomic_load_n(&gResultTransitionTrace, __ATOMIC_ACQUIRE) != 0;
+    if (trace)
+        th06_psp_boot_notef("RESULT SURFACE BEGIN I%ld %s", index, path ? path : "?");
+    long result;
+    u8 *encoded = path ? FileSystem::OpenPath(path, 0) : nullptr;
+    if (encoded && g_LastFileSize >= 2 && encoded[0] == 0xff && encoded[1] == 0xd8)
+    {
+        if (manager->surfaces[index] != nullptr)
+            manager->ReleaseSurface(index);
+        manager->surfaces[index] = th06_psp_img_load_jpeg_rgb24(encoded, g_LastFileSize);
+        std::free(encoded);
+        result = manager->surfaces[index] ? 0 : -1;
+    }
+    else
+    {
+        std::free(encoded);
+        result = th06_real_anm_load_surface(manager, index, path);
+    }
+    if (trace)
+    {
+        const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+        th06_psp_boot_notef("RESULT SURFACE END R%ld H%u/%uKB", result,
+                            heap.usedBytes / 1024u, heap.freeBytes / 1024u);
+    }
+    return result;
+}
+
+extern "C" long th06_real_anm_load_anm(AnmManager *manager, long index, const char *path, long spriteOffset)
+    asm("__real__ZN10AnmManager7LoadAnmElPKcl");
+extern "C" long th06_wrap_anm_load_anm(AnmManager *manager, long index, const char *path, long spriteOffset)
+    asm("__wrap__ZN10AnmManager7LoadAnmElPKcl");
+
+extern "C" long th06_wrap_anm_load_anm(AnmManager *manager, long index, const char *path, long spriteOffset)
+{
+    const bool trace = __atomic_load_n(&gResultTransitionTrace, __ATOMIC_ACQUIRE) != 0;
+    if (trace)
+        th06_psp_boot_notef("RESULT ANM BEGIN I%ld O%ld %s", index, spriteOffset, path ? path : "?");
+    const long result = th06_real_anm_load_anm(manager, index, path, spriteOffset);
+    if (trace)
+    {
+        const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+        th06_psp_boot_notef("RESULT ANM END I%ld R%ld H%u/%uKB", index, result,
+                            heap.usedBytes / 1024u, heap.freeBytes / 1024u);
+    }
+    return result;
 }
 
 #define TH06_WRAP_STAGE_VOID(tag, id)                                                                                 \
@@ -909,7 +1039,7 @@ extern "C" void th06_wrap_game_manager_cut()
     extern "C" void th06_wrap_##id() asm("__wrap_" tag);                                                           \
     extern "C" void th06_wrap_##id()                                                                                \
     {                                                                                                                 \
-        const bool trace = __atomic_load_n(&gStageReinitTrace, __ATOMIC_ACQUIRE) != 0;                                \
+        const bool trace = GameTeardownTracing();                                                                     \
         if (trace)                                                                                                    \
             th06_psp_boot_note(#id " BEGIN");                                                                        \
         th06_real_##id();                                                                                             \
@@ -931,7 +1061,7 @@ extern "C" void th06_wrap_stop_replay() asm("__wrap__ZN13ReplayManager13StopReco
 
 extern "C" void th06_wrap_stop_replay()
 {
-    const bool trace = __atomic_load_n(&gStageReinitTrace, __ATOMIC_ACQUIRE) != 0;
+    const bool trace = GameTeardownTracing();
     if (trace)
         th06_psp_boot_note("stop_replay BEGIN");
 
@@ -983,7 +1113,7 @@ extern "C" void th06_wrap_ecl_unload(EclManager *manager) asm("__wrap__ZN10EclMa
 
 extern "C" void th06_wrap_ecl_unload(EclManager *manager)
 {
-    const bool trace = __atomic_load_n(&gStageReinitTrace, __ATOMIC_ACQUIRE) != 0;
+    const bool trace = GameTeardownTracing();
     if (trace)
         th06_psp_boot_note("unload_ecl BEGIN");
 
@@ -1008,7 +1138,7 @@ extern "C" void th06_wrap_supervisor_stop_audio(Supervisor *supervisor)
 
 extern "C" void th06_wrap_supervisor_stop_audio(Supervisor *supervisor)
 {
-    const bool trace = __atomic_load_n(&gStageReinitTrace, __ATOMIC_ACQUIRE) != 0;
+    const bool trace = GameTeardownTracing();
     if (trace)
         th06_psp_boot_note("STOP AUDIO BEGIN");
     th06_real_supervisor_stop_audio(supervisor);
@@ -1017,7 +1147,7 @@ extern "C" void th06_wrap_supervisor_stop_audio(Supervisor *supervisor)
 }
 
 #define TH06_TRACE_STAGE_REGISTER_BEGIN(name)                                                                         \
-    const bool trace = __atomic_load_n(&gStageReinitTrace, __ATOMIC_ACQUIRE) != 0;                                    \
+    const bool trace = GameTeardownTracing();                                                                         \
     if (trace)                                                                                                        \
         th06_psp_boot_note(name " BEGIN")
 #define TH06_TRACE_STAGE_REGISTER_END(name, result)                                                                   \
@@ -1273,7 +1403,7 @@ extern "C" unsigned int th06_psp_player_update(Player *player)
         nextSnapshot += 600;
     }
 #endif
-#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_RESULT_SOAK)
     static int observedStage = -1;
     static unsigned int soakStageFrames;
     if (g_GameManager.currentStage != observedStage)
@@ -1303,12 +1433,21 @@ extern "C" unsigned int th06_psp_player_update(Player *player)
         g_Supervisor.curState = SUPERVISOR_STATE_GAMEMANAGER_REINIT;
     }
 #endif
+#if defined(TH06_PSP_RESULT_SOAK)
+    // Enter the exact normal-game game-over transition without waiting for a
+    // five-stage manual session. This diagnostic executable is PPSSPP-only.
+    if (soakStageFrames >= 300 && g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER)
+    {
+        th06_psp_boot_notef("RESULT SOAK FORCE GAME OVER ST%ld", g_GameManager.currentStage);
+        g_Supervisor.curState = SUPERVISOR_STATE_RESULTSCREEN_FROMGAME;
+    }
+#endif
 #endif
     return th06_psp_real_player_update(player);
 }
 
-#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_REPLAY_TRACE) || \
-    defined(TH06_PSP_PS3_REPLAY)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_RESULT_SOAK) || \
+    defined(TH06_PSP_REPLAY_TRACE) || defined(TH06_PSP_PS3_REPLAY)
 extern "C" unsigned int th06_psp_stage_soak_menu_update(MainMenu *)
 {
     static bool started;
@@ -1335,14 +1474,22 @@ extern "C" unsigned int th06_psp_stage_soak_menu_update(MainMenu *)
 #endif
         g_GameManager.livesRemaining = 2;
         g_GameManager.bombsRemaining = 3;
-#if defined(TH06_PSP_RECORD_SOAK)
+#if defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_RESULT_SOAK)
         g_GameManager.isInReplay = 0;
 #else
         g_GameManager.isInReplay = 1;
 #endif
         g_GameManager.isInPracticeMode = 0;
         g_GameManager.demoMode = 0;
-#if defined(TH06_PSP_RECORD_SOAK)
+#if defined(TH06_PSP_RESULT_SOAK)
+        // Replacing MainMenu::OnUpdate deliberately skips its STATE_STARTUP
+        // call to LoadTitleAnm(), which normally leaves the TL archive open
+        // for the later result screen. Recreate that archive precondition so
+        // this test reaches the same AddedCallback as a real menu-started run.
+        if (g_Supervisor.LoadPbg3(3, TH_TL_DAT_FILE) != 0)
+            th06_psp_boot_note("RESULT SOAK TL LOAD FAILED");
+#endif
+#if defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_RESULT_SOAK)
         g_GameManager.replayFile[0] = '\0';
 #else
         std::strcpy(reinterpret_cast<char *>(g_GameManager.replayFile), "replay/th6_01.rpy");
@@ -1351,6 +1498,8 @@ extern "C" unsigned int th06_psp_stage_soak_menu_update(MainMenu *)
         g_Supervisor.curState = SUPERVISOR_STATE_GAMEMANAGER;
 #if defined(TH06_PSP_RECORD_SOAK)
         th06_psp_boot_note("RECORD SOAK NORMAL REIMUA");
+#elif defined(TH06_PSP_RESULT_SOAK)
+        th06_psp_boot_note("RESULT SOAK NORMAL REIMUA");
 #elif defined(TH06_PSP_REPLAY_TRACE)
         th06_psp_boot_note("EXACT REPLAY TRACE th6_01 STAGE1");
 #elif defined(TH06_PSP_PS3_REPLAY)
@@ -1385,8 +1534,8 @@ extern "C" int th06_wrap_add_calc_chain(Chain *chain, ChainElem *elem, int prior
             elem->callback = reinterpret_cast<ChainCallback>(th06_wrap_effects_update);
         else if (callback == reinterpret_cast<ChainCallback>(th06_psp_real_player_update))
             elem->callback = reinterpret_cast<ChainCallback>(th06_psp_player_update);
-#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_REPLAY_TRACE) || \
-    defined(TH06_PSP_PS3_REPLAY)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_RESULT_SOAK) || \
+    defined(TH06_PSP_REPLAY_TRACE) || defined(TH06_PSP_PS3_REPLAY)
         else if (callback == reinterpret_cast<ChainCallback>(th06_psp_real_main_menu_update))
             elem->callback = reinterpret_cast<ChainCallback>(th06_psp_stage_soak_menu_update);
 #endif

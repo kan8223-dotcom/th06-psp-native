@@ -16,4 +16,5 @@ extern "C"
 {
     Th06PspHeapSnapshot th06_psp_heap_snapshot();
     void th06_psp_install_oom_handler();
+    void th06_psp_note_new_request(unsigned int bytes, unsigned int caller);
 }

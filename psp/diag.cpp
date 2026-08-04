@@ -62,8 +62,144 @@ extern "C" void th06_psp_audio_diag(unsigned int *queuedFrames, unsigned int *un
 extern "C" void th06_psp_audio_diag_window(unsigned int *minQueuedFrames, unsigned int *droppedFrames);
 extern "C" void th06_psp_sound_diag_window(unsigned int *maxProducerGapUs, unsigned int *maxMixUs,
                                             unsigned int *maxBgmReadUs, unsigned int *mixCalls);
+extern "C" void th06_psp_bgm_diag_window(unsigned int *reads, unsigned int *maxReadUs,
+                                          unsigned int *missPasses, unsigned int *missFrames);
 extern "C" void th06_psp_me_audio_diag_window(unsigned int *jobs, unsigned int *fallbacks,
                                                 unsigned int *timeouts, unsigned int *maxWaitUs);
+
+// The periodic counters are deliberately collected in RAM even in a normal
+// build.  Keeping the last few seconds only in the individual subsystems was
+// not enough: their window APIs reset every five seconds, so a later freeze or
+// HOME exit lost the evidence.  This aggregate is owned by the diagnostic
+// thread and is only serialized at an explicit transition/failure checkpoint.
+struct AudioFlightRecord
+{
+    unsigned int lastUnderruns;
+    unsigned int underruns;
+    unsigned int minQueued;
+    unsigned int droppedFrames;
+    unsigned int maxProducerGapUs;
+    unsigned int maxMixUs;
+    unsigned int maxBgmReadUs;
+    unsigned int bgmReads;
+    unsigned int bgmMissPasses;
+    unsigned int bgmMissFrames;
+    unsigned int meJobs;
+    unsigned int meFallbacks;
+    unsigned int meTimeouts;
+    unsigned int meMaxWaitUs;
+    unsigned int anomalyBits;
+};
+
+enum AudioAnomaly : unsigned int
+{
+    AUDIO_ANOMALY_DAC_UNDERRUN = 1u << 0,
+    AUDIO_ANOMALY_PRODUCER_GAP = 1u << 1,
+    AUDIO_ANOMALY_BGM_IO_STALL = 1u << 2,
+    AUDIO_ANOMALY_BGM_CACHE_MISS = 1u << 3,
+    AUDIO_ANOMALY_ME_TIMEOUT = 1u << 4,
+    AUDIO_ANOMALY_QUEUE_DROP = 1u << 5,
+};
+
+// A healthy producer normally revisits the 3072-frame watermark every 2 ms.
+// 20 ms is diagnostic, while still far below the 69.7 ms PCM cushion.  A
+// 100 ms Memory Stick read is recorded independently: asynchronous I/O can be
+// slow without being audible, and the cache-miss counters prove whether that
+// slow read actually reached the mixer.
+constexpr unsigned int kProducerGapDiagnosticUs = 20u * 1000u;
+constexpr unsigned int kBgmIoStallDiagnosticUs = 100u * 1000u;
+
+AudioFlightRecord gAudioFlight{};
+volatile int gAudioFlightSampling;
+
+struct AudioDiagWindow
+{
+    unsigned int queued;
+    unsigned int underruns;
+    unsigned int underrunDelta;
+    unsigned int readFrame;
+    unsigned int writeFrame;
+    unsigned int minQueued;
+    unsigned int droppedFrames;
+    unsigned int maxProducerGapUs;
+    unsigned int maxMixUs;
+    unsigned int maxBgmReadUs;
+    unsigned int mixCalls;
+    unsigned int bgmReads;
+    unsigned int bgmMissPasses;
+    unsigned int bgmMissFrames;
+    unsigned int meJobs;
+    unsigned int meFallbacks;
+    unsigned int meTimeouts;
+    unsigned int meMaxWaitUs;
+};
+
+void RecordMaximum(unsigned int &destination, unsigned int sample)
+{
+    if (sample > destination)
+        destination = sample;
+}
+
+bool CollectAudioDiagnostics(AudioDiagWindow &window, bool keepLocked = false)
+{
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&gAudioFlightSampling, &expected, 1, false, __ATOMIC_ACQUIRE,
+                                     __ATOMIC_RELAXED))
+        return false;
+
+    th06_psp_audio_diag(&window.queued, &window.underruns, &window.readFrame, &window.writeFrame);
+    th06_psp_audio_diag_window(&window.minQueued, &window.droppedFrames);
+    // BGM owns the read maximum now.  Passing nullptr here prevents the older
+    // sound window from consuming it before cache-miss telemetry is sampled.
+    th06_psp_sound_diag_window(&window.maxProducerGapUs, &window.maxMixUs, nullptr, &window.mixCalls);
+    th06_psp_bgm_diag_window(&window.bgmReads, &window.maxBgmReadUs, &window.bgmMissPasses,
+                             &window.bgmMissFrames);
+    th06_psp_me_audio_diag_window(&window.meJobs, &window.meFallbacks, &window.meTimeouts,
+                                  &window.meMaxWaitUs);
+
+    const unsigned int underrunDelta = window.underruns - gAudioFlight.lastUnderruns;
+    window.underrunDelta = underrunDelta;
+    gAudioFlight.lastUnderruns = window.underruns;
+    gAudioFlight.underruns += underrunDelta;
+    if (window.minQueued < gAudioFlight.minQueued)
+        gAudioFlight.minQueued = window.minQueued;
+    gAudioFlight.droppedFrames += window.droppedFrames;
+    RecordMaximum(gAudioFlight.maxProducerGapUs, window.maxProducerGapUs);
+    RecordMaximum(gAudioFlight.maxMixUs, window.maxMixUs);
+    RecordMaximum(gAudioFlight.maxBgmReadUs, window.maxBgmReadUs);
+    gAudioFlight.bgmReads += window.bgmReads;
+    gAudioFlight.bgmMissPasses += window.bgmMissPasses;
+    gAudioFlight.bgmMissFrames += window.bgmMissFrames;
+    gAudioFlight.meJobs += window.meJobs;
+    gAudioFlight.meFallbacks += window.meFallbacks;
+    gAudioFlight.meTimeouts += window.meTimeouts;
+    RecordMaximum(gAudioFlight.meMaxWaitUs, window.meMaxWaitUs);
+
+    if (underrunDelta != 0)
+        gAudioFlight.anomalyBits |= AUDIO_ANOMALY_DAC_UNDERRUN;
+    if (window.maxProducerGapUs >= kProducerGapDiagnosticUs)
+        gAudioFlight.anomalyBits |= AUDIO_ANOMALY_PRODUCER_GAP;
+    if (window.maxBgmReadUs >= kBgmIoStallDiagnosticUs)
+        gAudioFlight.anomalyBits |= AUDIO_ANOMALY_BGM_IO_STALL;
+    if (window.bgmMissPasses != 0 || window.bgmMissFrames != 0)
+        gAudioFlight.anomalyBits |= AUDIO_ANOMALY_BGM_CACHE_MISS;
+    if (window.meTimeouts != 0)
+        gAudioFlight.anomalyBits |= AUDIO_ANOMALY_ME_TIMEOUT;
+    if (window.droppedFrames != 0)
+        gAudioFlight.anomalyBits |= AUDIO_ANOMALY_QUEUE_DROP;
+
+    if (!keepLocked)
+        __atomic_store_n(&gAudioFlightSampling, 0, __ATOMIC_RELEASE);
+    return true;
+}
+
+void ResetAudioFlightInterval()
+{
+    const unsigned int lastUnderruns = gAudioFlight.lastUnderruns;
+    std::memset(&gAudioFlight, 0, sizeof(gAudioFlight));
+    gAudioFlight.lastUnderruns = lastUnderruns;
+    gAudioFlight.minQueued = ~0u;
+}
 
 void FillRect(int y0, int y1, unsigned int color)
 {
@@ -121,7 +257,6 @@ int EscapeThread(SceSize, void *)
     unsigned int lastFrames = __atomic_load_n(&gFramesPresented, __ATOMIC_RELAXED);
     unsigned int lastRuntimeProgress = __atomic_load_n(&gRuntimeProgress, __ATOMIC_RELAXED);
     unsigned int lastHeartbeatFrames = lastFrames;
-    unsigned int lastAudioUnderruns = 0;
     unsigned int lastProgressUs = sceKernelGetSystemTimeLow();
     unsigned int lastHeartbeatUs = lastProgressUs;
     unsigned int lastPowerTickUs = lastProgressUs;
@@ -168,37 +303,21 @@ int EscapeThread(SceSize, void *)
 
         if (gBootPhaseEnded && static_cast<unsigned int>(now - lastHeartbeatUs) >= kRuntimeHeartbeatUs)
         {
-            unsigned int queued = 0;
-            unsigned int underruns = 0;
-            unsigned int readFrame = 0;
-            unsigned int writeFrame = 0;
-            th06_psp_audio_diag(&queued, &underruns, &readFrame, &writeFrame);
-            unsigned int minQueued = 0;
-            unsigned int droppedFrames = 0;
-            unsigned int maxProducerGapUs = 0;
-            unsigned int maxMixUs = 0;
-            unsigned int maxBgmReadUs = 0;
-            unsigned int mixCalls = 0;
-            unsigned int meJobs = 0;
-            unsigned int meFallbacks = 0;
-            unsigned int meTimeouts = 0;
-            unsigned int meMaxWaitUs = 0;
-            th06_psp_audio_diag_window(&minQueued, &droppedFrames);
-            th06_psp_sound_diag_window(&maxProducerGapUs, &maxMixUs, &maxBgmReadUs, &mixCalls);
-            th06_psp_me_audio_diag_window(&meJobs, &meFallbacks, &meTimeouts, &meMaxWaitUs);
-            const unsigned int underrunDelta = underruns - lastAudioUnderruns;
-            lastAudioUnderruns = underruns;
+            AudioDiagWindow audio{};
+            const bool audioSampled = CollectAudioDiagnostics(audio);
             const unsigned int deltaFrames = frames - lastHeartbeatFrames;
-            if (th06_psp_periodic_diag_enabled())
+            if (audioSampled && th06_psp_periodic_diag_enabled())
             {
-                th06_psp_boot_notef("RUN F%u +%u Q%u U%u RW%u/%u MEM%u/%uKB", frames, deltaFrames, queued,
-                                    underruns, readFrame, writeFrame,
+                th06_psp_boot_notef("RUN F%u +%u Q%u U%u RW%u/%u MEM%u/%uKB", frames, deltaFrames,
+                                    audio.queued, audio.underruns, audio.readFrame, audio.writeFrame,
                                     static_cast<unsigned int>(sceKernelTotalFreeMemSize() / 1024),
                                     static_cast<unsigned int>(sceKernelMaxFreeMemSize() / 1024));
-                th06_psp_boot_notef("AUD U+%u MIN%u DROP%u GAP%uus MIX%uus IO%uus N%u", underrunDelta,
-                                    minQueued, droppedFrames, maxProducerGapUs, maxMixUs, maxBgmReadUs, mixCalls);
-                th06_psp_boot_notef("ME AUD J%u SC%u TO%u W%uus", meJobs, meFallbacks, meTimeouts,
-                                    meMaxWaitUs);
+                th06_psp_boot_notef("AUD U+%u MIN%u DROP%u GAP%uus MIX%uus IO%uus R%u CM%u/%u",
+                                    audio.underrunDelta, audio.minQueued, audio.droppedFrames,
+                                    audio.maxProducerGapUs, audio.maxMixUs, audio.maxBgmReadUs,
+                                    audio.bgmReads, audio.bgmMissPasses, audio.bgmMissFrames);
+                th06_psp_boot_notef("ME AUD J%u SC%u TO%u W%uus", audio.meJobs, audio.meFallbacks,
+                                    audio.meTimeouts, audio.meMaxWaitUs);
             }
             lastHeartbeatFrames = frames;
             lastHeartbeatUs = now;
@@ -207,6 +326,7 @@ int EscapeThread(SceSize, void *)
         if (gBootPhaseEnded && static_cast<unsigned int>(now - lastProgressUs) >= kRuntimeStallUs &&
             __atomic_load_n(&gExitRequested, __ATOMIC_ACQUIRE) == 0)
         {
+            th06_psp_audio_diag_checkpoint("STALL", 1);
             th06_psp_boot_notef("RUNTIME STALL 8s AT F%u", frames);
             th06_psp_request_exit(3);
         }
@@ -215,6 +335,10 @@ int EscapeThread(SceSize, void *)
         if (exitReason != 0)
         {
             const char *name = exitReason == 1 ? "HOME" : (exitReason == 2 ? "COMBO" : "STALL");
+            // STALL was captured immediately above.  HOME/COMBO need the same
+            // last-moment RAM snapshot before the process leaves.
+            if (exitReason != 3)
+                th06_psp_audio_diag_checkpoint(name, 1);
             th06_psp_boot_notef("EXIT REQUEST %s F%u", name, frames);
             sceKernelExitGame();
             th06_psp_boot_notef("EXIT CALL RETURNED %s", name);
@@ -226,6 +350,34 @@ int EscapeThread(SceSize, void *)
 }
 
 } // namespace
+
+extern "C" void th06_psp_audio_diag_checkpoint(const char *tag, int always)
+{
+    AudioDiagWindow latest{};
+    if (!CollectAudioDiagnostics(latest, true))
+        return;
+
+    // Copy and retire the interval before touching FAT.  The five-second
+    // collector can resume while the one durable line is being appended.
+    const AudioFlightRecord record = gAudioFlight;
+    ResetAudioFlightInterval();
+    __atomic_store_n(&gAudioFlightSampling, 0, __ATOMIC_RELEASE);
+
+    if (!always && record.anomalyBits == 0)
+        return;
+
+    const unsigned int minimum = record.minQueued == ~0u ? latest.queued : record.minQueued;
+    // C bitfield: 01 DAC underrun, 02 producer gap, 04 slow BGM read,
+    // 08 BGM cache miss, 10 ME timeout, 20 PCM queue drop.  This single line
+    // is enough to distinguish the four suspected audio failure classes and
+    // avoids a burst of competing Memory Stick writes at the checkpoint.
+    th06_psp_boot_notef("AUD! %s C%X U%u Q%u G%u I%u CM%u/%u ME%u/%u/%u D%u M%u R%u",
+                        tag ? tag : "?", record.anomalyBits, record.underruns, minimum,
+                        record.maxProducerGapUs, record.maxBgmReadUs, record.bgmMissPasses,
+                        record.bgmMissFrames, record.meJobs, record.meFallbacks,
+                        record.meTimeouts, record.droppedFrames, record.maxMixUs,
+                        record.bgmReads);
+}
 
 // -------------------------------------------------------------------- overlay
 extern "C" void th06_psp_overlay_push(const char *message)
@@ -335,6 +487,7 @@ extern "C" void th06_psp_escape_start()
 {
     if (gEscapeThread >= 0)
         return;
+    ResetAudioFlightInterval();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     // Above the audio output thread (0x10). A saturated audio path must never

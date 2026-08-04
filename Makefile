@@ -60,6 +60,12 @@ ifeq ($(RECORD_SOAK),1)
 CXXFLAGS += -DTH06_PSP_RECORD_SOAK
 PSP_EBOOT_TITLE := TH06 PSP record soak test
 endif
+# make RESULT_SOAK=1 -- PPSSPP-only unattended normal-play -> game-over result test.
+# It takes the same teardown/registration path as choosing "No" at Continue.
+ifeq ($(RESULT_SOAK),1)
+CXXFLAGS += -DTH06_PSP_RESULT_SOAK
+PSP_EBOOT_TITLE := TH06 PSP result soak test
+endif
 # make REPLAY_TRACE=1 -- replay the user's stage-1 capture without input
 # injection or invulnerability, and trace only a genuinely lethal boss hit.
 # Keep this as a separate diagnostic executable; never ship it as the normal
@@ -87,6 +93,9 @@ LIBS := -L$(MECC_BUILD_DIR) -lme-core \
         -Wl,--wrap=_ZN12AsciiManager13InitializeVmsEv \
         -Wl,--wrap=_ZN11GameManager13RegisterChainEv \
         -Wl,--wrap=_ZN11GameManager8CutChainEv \
+        -Wl,--wrap=_ZN12ResultScreen13RegisterChainEl \
+        -Wl,--wrap=_ZN10AnmManager11LoadSurfaceElPKc \
+        -Wl,--wrap=_ZN10AnmManager7LoadAnmElPKcl \
         -Wl,--wrap=_ZN10Supervisor9StopAudioEv \
         -Wl,--wrap=_ZN5Stage8CutChainEv \
         -Wl,--wrap=_ZN13BulletManager8CutChainEv \

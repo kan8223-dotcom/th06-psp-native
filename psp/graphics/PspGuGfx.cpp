@@ -42,7 +42,34 @@ constexpr unsigned int kListSoftLimit = kCommandBytes - 16 * 1024;
 alignas(16) unsigned int gCommandList[kCommandBytes / sizeof(unsigned int)];
 alignas(16) unsigned char gVertexArena[kVertexBytes];
 
-struct GuVertex
+struct GuVertexPosition
+{
+    float x;
+    float y;
+    float z;
+};
+static_assert(sizeof(GuVertexPosition) == 12, "unexpected GE position vertex layout");
+
+struct GuVertexTexPosition
+{
+    float u;
+    float v;
+    float x;
+    float y;
+    float z;
+};
+static_assert(sizeof(GuVertexTexPosition) == 20, "unexpected GE textured vertex layout");
+
+struct GuVertexColorPosition
+{
+    unsigned int color;
+    float x;
+    float y;
+    float z;
+};
+static_assert(sizeof(GuVertexColorPosition) == 16, "unexpected GE colored vertex layout");
+
+struct GuVertexTexColorPosition
 {
     float u;
     float v;
@@ -51,7 +78,7 @@ struct GuVertex
     float y;
     float z;
 };
-static_assert(sizeof(GuVertex) == 24, "unexpected GE vertex layout");
+static_assert(sizeof(GuVertexTexColorPosition) == 24, "unexpected GE textured-color vertex layout");
 
 struct GuTexture
 {
@@ -159,7 +186,10 @@ class PspGuGfx final : public GfxInterface
   public:
     PspGuGfx()
         : mBoundTexture(0), mVertexOffset(0), mCurrentDrawBuffer(0), mListOpen(false), mError(false),
-          mUseTexCoord(false), mUseDiffuse(false), mBlendMode(BLEND_INV_SRC_ALPHA),
+          mUseTexCoord(false), mUseDiffuse(false), mTextureEnableKnown(false), mTextureEnabled(false),
+          mAppliedTexture(~0u), mColorOpKnown(false), mAppliedColorOp(COLOR_OP_MODULATE),
+          mPrimitiveColorKnown(false), mAppliedPrimitiveColor(0),
+          mBlendMode(BLEND_INV_SRC_ALPHA),
           mDepthFunc(DEPTH_FUNC_LEQUAL), mDepthWrite(true), mDepthTest(false), mTextureFactor(0xffffffffu),
           mColorOp(COLOR_OP_MODULATE), mClearDepth(1.0f), mClearColor(0xff000000u), mFogNear(1000.0f),
           mFogFar(5000.0f), mFogColor(0xffa0a0a0u), mFrames(0), mFirstFrameUs(0), mDraws(0), mVertices(0),
@@ -510,6 +540,8 @@ class PspGuGfx final : public GfxInterface
         if (mTextures[handle.id].pixels && !mTextures[handle.id].borrowedSurfaceCache)
             RecycleTexturePixels(mTextures[handle.id]);
         mTextures[handle.id] = GuTexture{};
+        if (mAppliedTexture == handle.id)
+            mAppliedTexture = ~0u;
         if (mBoundTexture == handle.id)
             mBoundTexture = 0;
     }
@@ -529,6 +561,11 @@ class PspGuGfx final : public GfxInterface
         }
 
         GuTexture &texture = mTextures[mBoundTexture];
+        // The handle may retain its numeric value while its format, storage
+        // dimensions, or backing pointer changes.  Force the next draw to
+        // publish the new image state in that case.
+        if (mAppliedTexture == mBoundTexture)
+            mAppliedTexture = ~0u;
         const bool surfaceCandidate = fmt == PIXEL_RGB && type == PIXEL_UNSIGNED_BYTE &&
                                       (width > 512 || height > 512);
         const int psm = surfaceCandidate              ? GU_PSM_5650
@@ -675,6 +712,8 @@ class PspGuGfx final : public GfxInterface
         if (mBoundTexture == 0 || !data)
             return;
         GuTexture &texture = mTextures[mBoundTexture];
+        if (mAppliedTexture == mBoundTexture)
+            mAppliedTexture = ~0u;
         if ((!texture.pixels && !texture.surfaceCandidate) || xoffset < 0 || yoffset < 0 ||
             xoffset + width > static_cast<i32>(texture.width) ||
             yoffset + height > static_cast<i32>(texture.height))
@@ -823,7 +862,18 @@ class PspGuGfx final : public GfxInterface
             mAttributeStrides[VERTEX_ARRAY_POSITION] == 0)
             return;
 
-        const unsigned int required = static_cast<unsigned int>(count) * sizeof(GuVertex);
+        // Vertex color and texture coordinates are optional GE attributes.
+        // The old fixed 24-byte layout wrote both for every vertex even when
+        // TH06's batched sprites used a constant texture factor.  Select the
+        // smallest native layout before reserving the live vertex arena.
+        const bool textured = mUseTexCoord && mAttributePointers[VERTEX_ARRAY_TEX_COORD];
+        const bool colored = mUseDiffuse && mAttributePointers[VERTEX_ARRAY_DIFFUSE];
+        const unsigned int vertexBytes = textured
+                                             ? (colored ? sizeof(GuVertexTexColorPosition)
+                                                        : sizeof(GuVertexTexPosition))
+                                             : (colored ? sizeof(GuVertexColorPosition)
+                                                        : sizeof(GuVertexPosition));
+        const unsigned int required = static_cast<unsigned int>(count) * vertexBytes;
         if (required > kVertexBytes)
         {
             mError = true;
@@ -833,45 +883,92 @@ class PspGuGfx final : public GfxInterface
         if (mVertexOffset + required > kVertexBytes || static_cast<unsigned int>(sceGuCheckList()) > kListSoftLimit)
             SubmitAndRestart();
 
-        auto *vertices = reinterpret_cast<GuVertex *>(gVertexArena + mVertexOffset);
+        void *vertices = gVertexArena + mVertexOffset;
         const unsigned int constantColor = ToGuColor(mTextureFactor);
-        for (int i = 0; i < count; ++i)
+        int vertexType = GU_VERTEX_32BITF | GU_TRANSFORM_3D;
+        if (!colored && (!mPrimitiveColorKnown || mAppliedPrimitiveColor != constantColor))
         {
-            const int sourceIndex = start + i;
-            const auto *position = reinterpret_cast<const float *>(
-                mAttributePointers[VERTEX_ARRAY_POSITION] + mAttributeStrides[VERTEX_ARRAY_POSITION] * sourceIndex);
-            vertices[i].x = position[0];
-            vertices[i].y = position[1];
-            vertices[i].z = position[2];
+            sceGuColor(constantColor);
+            mPrimitiveColorKnown = true;
+            mAppliedPrimitiveColor = constantColor;
+        }
 
-            if (mUseTexCoord && mAttributePointers[VERTEX_ARRAY_TEX_COORD])
+        if (textured && colored)
+        {
+            auto *out = static_cast<GuVertexTexColorPosition *>(vertices);
+            for (int i = 0; i < count; ++i)
             {
+                const int sourceIndex = start + i;
+                const auto *position = reinterpret_cast<const float *>(
+                    mAttributePointers[VERTEX_ARRAY_POSITION] +
+                    mAttributeStrides[VERTEX_ARRAY_POSITION] * sourceIndex);
                 const auto *uv = reinterpret_cast<const float *>(
                     mAttributePointers[VERTEX_ARRAY_TEX_COORD] + mAttributeStrides[VERTEX_ARRAY_TEX_COORD] * sourceIndex);
-                vertices[i].u = uv[0];
-                vertices[i].v = uv[1];
-            }
-            else
-            {
-                vertices[i].u = 0.0f;
-                vertices[i].v = 0.0f;
-            }
-
-            if (mUseDiffuse && mAttributePointers[VERTEX_ARRAY_DIFFUSE])
-            {
                 const auto *diffuse = mAttributePointers[VERTEX_ARRAY_DIFFUSE] +
                                       mAttributeStrides[VERTEX_ARRAY_DIFFUSE] * sourceIndex;
-                vertices[i].color = DiffuseColor(diffuse);
+                out[i].u = uv[0];
+                out[i].v = uv[1];
+                out[i].color = DiffuseColor(diffuse);
+                out[i].x = position[0];
+                out[i].y = position[1];
+                out[i].z = position[2];
             }
-            else
+            vertexType |= GU_TEXTURE_32BITF | GU_COLOR_8888;
+        }
+        else if (textured)
+        {
+            auto *out = static_cast<GuVertexTexPosition *>(vertices);
+            for (int i = 0; i < count; ++i)
             {
-                vertices[i].color = constantColor;
+                const int sourceIndex = start + i;
+                const auto *position = reinterpret_cast<const float *>(
+                    mAttributePointers[VERTEX_ARRAY_POSITION] +
+                    mAttributeStrides[VERTEX_ARRAY_POSITION] * sourceIndex);
+                const auto *uv = reinterpret_cast<const float *>(
+                    mAttributePointers[VERTEX_ARRAY_TEX_COORD] + mAttributeStrides[VERTEX_ARRAY_TEX_COORD] * sourceIndex);
+                out[i].u = uv[0];
+                out[i].v = uv[1];
+                out[i].x = position[0];
+                out[i].y = position[1];
+                out[i].z = position[2];
+            }
+            vertexType |= GU_TEXTURE_32BITF;
+        }
+        else if (colored)
+        {
+            auto *out = static_cast<GuVertexColorPosition *>(vertices);
+            for (int i = 0; i < count; ++i)
+            {
+                const int sourceIndex = start + i;
+                const auto *position = reinterpret_cast<const float *>(
+                    mAttributePointers[VERTEX_ARRAY_POSITION] +
+                    mAttributeStrides[VERTEX_ARRAY_POSITION] * sourceIndex);
+                const auto *diffuse = mAttributePointers[VERTEX_ARRAY_DIFFUSE] +
+                                      mAttributeStrides[VERTEX_ARRAY_DIFFUSE] * sourceIndex;
+                out[i].color = DiffuseColor(diffuse);
+                out[i].x = position[0];
+                out[i].y = position[1];
+                out[i].z = position[2];
+            }
+            vertexType |= GU_COLOR_8888;
+        }
+        else
+        {
+            auto *out = static_cast<GuVertexPosition *>(vertices);
+            for (int i = 0; i < count; ++i)
+            {
+                const int sourceIndex = start + i;
+                const auto *position = reinterpret_cast<const float *>(
+                    mAttributePointers[VERTEX_ARRAY_POSITION] +
+                    mAttributeStrides[VERTEX_ARRAY_POSITION] * sourceIndex);
+                out[i].x = position[0];
+                out[i].y = position[1];
+                out[i].z = position[2];
             }
         }
 
         ApplyTexture();
         const int primitive = type == PRIM_TRIANGLE_STRIP ? GU_TRIANGLE_STRIP : GU_TRIANGLES;
-        constexpr int vertexType = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D;
         // GU_DIRECT may consume this command before sceGuFinish().  Publish
         // the vertices before the draw command enters the live list; delaying
         // this to frame end produces timing-dependent geometry corruption.
@@ -996,6 +1093,13 @@ class PspGuGfx final : public GfxInterface
     bool mError;
     bool mUseTexCoord;
     bool mUseDiffuse;
+    bool mTextureEnableKnown;
+    bool mTextureEnabled;
+    unsigned int mAppliedTexture;
+    bool mColorOpKnown;
+    ColorOp mAppliedColorOp;
+    bool mPrimitiveColorKnown;
+    unsigned int mAppliedPrimitiveColor;
     BlendMode mBlendMode;
     DepthFunc mDepthFunc;
     bool mDepthWrite;
@@ -1388,28 +1492,39 @@ class PspGuGfx final : public GfxInterface
 
     void ApplyTexture()
     {
-        if (!mUseTexCoord || mBoundTexture == 0 || !mTextures[mBoundTexture].pixels)
+        const bool enabled = mUseTexCoord && mBoundTexture != 0 && mTextures[mBoundTexture].pixels;
+        if (!mTextureEnableKnown || mTextureEnabled != enabled)
         {
-            sceGuDisable(GU_TEXTURE_2D);
-            return;
+            if (enabled)
+                sceGuEnable(GU_TEXTURE_2D);
+            else
+                sceGuDisable(GU_TEXTURE_2D);
+            mTextureEnableKnown = true;
+            mTextureEnabled = enabled;
         }
+        if (!enabled)
+            return;
 
         const GuTexture &texture = mTextures[mBoundTexture];
-        sceGuEnable(GU_TEXTURE_2D);
-        sceGuTexMode(texture.psm, 0, 0, texture.swizzled ? GU_TRUE : GU_FALSE);
-        sceGuTexImage(0, texture.storageWidth, texture.storageHeight, texture.storageWidth, texture.pixels);
-        // Float UVs in the GU 3D path are normalized.  The PSPSDK cube and
-        // sprite samples both feed 0..1 and use TexScale(1,1).  Only compensate
-        // for our power-of-two padding; multiplying by pixel dimensions here
-        // repeats the atlas hundreds of times and produces the horizontal-line
-        // corruption seen in the first GE run.
-        sceGuTexScale(texture.sampleScaleX, texture.sampleScaleY);
-        sceGuTexOffset(0.0f, 0.0f);
-        sceGuTexWrap(GU_REPEAT, GU_REPEAT);
-        sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-        const int op = mColorOp == COLOR_OP_ADD ? GU_TFX_ADD
-                                                : (mColorOp == COLOR_OP_REPLACE ? GU_TFX_REPLACE : GU_TFX_MODULATE);
-        sceGuTexFunc(op, GU_TCC_RGBA);
+        if (mAppliedTexture != mBoundTexture)
+        {
+            sceGuTexMode(texture.psm, 0, 0, texture.swizzled ? GU_TRUE : GU_FALSE);
+            sceGuTexImage(0, texture.storageWidth, texture.storageHeight, texture.storageWidth, texture.pixels);
+            // Float UVs in the GU 3D path are normalized.  Only compensate
+            // for power-of-two padding; multiplying by pixel dimensions here
+            // repeats the atlas hundreds of times.
+            sceGuTexScale(texture.sampleScaleX, texture.sampleScaleY);
+            mAppliedTexture = mBoundTexture;
+        }
+        if (!mColorOpKnown || mAppliedColorOp != mColorOp)
+        {
+            const int op = mColorOp == COLOR_OP_ADD
+                               ? GU_TFX_ADD
+                               : (mColorOp == COLOR_OP_REPLACE ? GU_TFX_REPLACE : GU_TFX_MODULATE);
+            sceGuTexFunc(op, GU_TCC_RGBA);
+            mAppliedColorOp = mColorOp;
+            mColorOpKnown = true;
+        }
     }
 
     static void WriteTexturePixel(GuTexture &texture, unsigned int x, unsigned int y, unsigned int r,

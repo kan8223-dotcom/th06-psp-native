@@ -288,7 +288,9 @@ static int dispatch_mix(const Th06PspMixJob *job, short *output)
             __atomic_store_n(&gMeAudioActive, 0, __ATOMIC_RELEASE);
             __atomic_fetch_add(&gMeTimeouts, 1, __ATOMIC_RELAXED);
             __atomic_fetch_add(&gMeFallbacks, 1, __ATOMIC_RELAXED);
-            th06_psp_boot_note("ME AUDIO TIMEOUT -> SC");
+            // Never perform FAT I/O from the mixer hot path.  The diagnostic
+            // thread collects this timeout in RAM and a transition/failure
+            // checkpoint emits it together with underrun/cache evidence.
             mix_on_sc(job, output);
             return 0;
         }

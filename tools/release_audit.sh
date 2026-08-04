@@ -2,6 +2,7 @@
 set -eu
 
 fail=0
+test_eboot_pattern='STAGE SOAK|RECORD SOAK|RESULT SOAK|PS3 REPLAY AUTO|EXACT REPLAY TRACE'
 
 # Build the retired MECC repository name at runtime so the forbidden spelling
 # does not become part of this repository merely because the audit checks it.
@@ -17,6 +18,11 @@ tracked_forbidden=$(git ls-files | grep -Ei '(^|/)(th6|bgm)(/|$)|紅魔郷.*\.DA
 if [ -n "$tracked_forbidden" ]; then
     echo "[FAIL] proprietary/user/generated files are tracked:"
     echo "$tracked_forbidden"
+    fail=1
+fi
+
+if [ -f EBOOT.PBP ] && strings EBOOT.PBP | grep -Eq "$test_eboot_pattern"; then
+    echo "[FAIL] PPSSPP-only automatic test marker entered EBOOT.PBP"
     fail=1
 fi
 
@@ -44,6 +50,10 @@ if [ -d dist ]; then
             echo "[FAIL] obsolete MECC repository name entered $archive"
             fail=1
         fi
+        if unzip -p "$archive" TH06PSP/EBOOT.PBP 2>/dev/null | strings | grep -Eq "$test_eboot_pattern"; then
+            echo "[FAIL] PPSSPP-only automatic test marker entered $archive"
+            fail=1
+        fi
     done
 fi
 
@@ -51,4 +61,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[OK] release audit: no original TH06 data, replay, score, or obsolete MECC name"
+echo "[OK] release audit: no original TH06 data, replay, score, test EBOOT, or obsolete MECC name"

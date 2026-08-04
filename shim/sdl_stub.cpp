@@ -234,6 +234,7 @@ int SDL_BYTESPERPIXEL(Uint32 fmt)
 static SDL_Surface *g_PspSurfaces[128];
 static Uint32 g_PspNextSurfaceSerial;
 static Uint32 g_PspLastLockedSurfaceSerial;
+extern "C" unsigned int th06_psp_ge_trim_surface_cache();
 
 static void PspRegisterSurface(SDL_Surface *surface)
 {
@@ -283,15 +284,34 @@ extern "C" void th06_psp_mark_surface_ge_cached(Uint32 serial, int cached)
 
 SDL_Surface *SDL_CreateRGBSurfaceWithFormat(Uint32, int width, int height, int, Uint32 format)
 {
+    if (width < 0 || height < 0)
+        return nullptr;
     SDL_Surface *s = (SDL_Surface *)std::calloc(1, sizeof(SDL_Surface));
+    if (!s)
+        return nullptr;
     s->format = (SDL_PixelFormat *)std::calloc(1, sizeof(SDL_PixelFormat));
+    if (!s->format)
+    {
+        std::free(s);
+        return nullptr;
+    }
     s->format->format = format;
     s->format->BitsPerPixel = (Uint8)SDL_BITSPERPIXEL(format);
     s->format->BytesPerPixel = (Uint8)SDL_BYTESPERPIXEL(format);
     s->w = width;
     s->h = height;
     s->pitch = width * s->format->BytesPerPixel;
-    s->pixels = std::calloc(1, (size_t)s->pitch * height);
+    const size_t pixelBytes = (size_t)s->pitch * (size_t)height;
+    if (pixelBytes != 0)
+    {
+        s->pixels = std::calloc(1, pixelBytes);
+        if (!s->pixels)
+        {
+            std::free(s->format);
+            std::free(s);
+            return nullptr;
+        }
+    }
     s->refcount = 1;
 #ifdef TH06_PSP
     PspRegisterSurface(s);
@@ -314,6 +334,12 @@ void SDL_FreeSurface(SDL_Surface *surface)
     if (!surface)
         return;
 #ifdef TH06_PSP
+    // The GE owns a downscaled copy only while its source surface is alive.
+    // Retire that unborrowed copy before releasing the source allocation so a
+    // title/demo image replacement cannot leave a 512 KiB hole in PSP-1000's
+    // heap until the later GameManager boundary.
+    if (surface->pspGeCached)
+        th06_psp_ge_trim_surface_cache();
     PspUnregisterSurface(surface);
 #endif
     if (!(surface->flags & 1))

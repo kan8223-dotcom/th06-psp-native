@@ -35,8 +35,11 @@ immediately before entering the public PSPPMD initialization path.
 The real-hardware log before this work shows that mixer maxima almost equal
 the 64 KiB WAV read maxima: typical `MIX 18--21 ms / IO 17--20 ms`, with a
 worst observed `MIX 242 ms / IO 242 ms`.  Therefore ME mixing cannot repair
-memory-stick latency.  The BGM read-ahead window must be enlarged separately;
-claiming ME fixed an I/O underrun is forbidden.
+memory-stick latency.  BGM I/O now uses a priority-`0x1c` worker and six 64 KiB
+blocks: two are filled synchronously at track start and four asynchronously,
+while the total cache remains 384 KiB. Read count, maximum latency and actual
+cache-miss passes/frames are retained in RAM. Claiming ME fixed an I/O underrun
+without those counters is forbidden.
 
 The intended benefit is narrower: sample mixing remains independent of SC
 render load, and the same worker can later absorb a decoder without changing

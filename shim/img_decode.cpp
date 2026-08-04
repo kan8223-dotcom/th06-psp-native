@@ -163,6 +163,56 @@ static SDL_Surface *LoadJpegFromMem(const Uint8 *data, size_t size)
     return surface;
 }
 
+// Large TH06 menu/result backgrounds are consumed as RGB24 surfaces.  The
+// generic path first allocates a 640x480 RGBA surface (1.2 MiB), then a second
+// 900 KiB RGB surface.  PSP can decode JPEG scanlines directly into the final
+// RGB24 allocation, avoiding that fragmentation-sensitive peak.
+extern "C" SDL_Surface *th06_psp_img_load_jpeg_rgb24(const Uint8 *data, size_t size)
+{
+    if (!data || size < 2 || data[0] != 0xFF || data[1] != 0xD8)
+        return nullptr;
+
+    jpeg_decompress_struct cinfo{};
+    JpegErrorMgr jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = JpegErrorExit;
+
+    SDL_Surface *surface = nullptr;
+    bool created = false;
+    if (setjmp(jerr.jmp))
+    {
+        if (created)
+            jpeg_destroy_decompress(&cinfo);
+        if (surface)
+            SDL_FreeSurface(surface);
+        return nullptr;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    created = true;
+    jpeg_mem_src(&cinfo, const_cast<unsigned char *>(data), static_cast<unsigned long>(size));
+    jpeg_read_header(&cinfo, TRUE);
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+
+    surface = SDL_CreateRGBSurfaceWithFormat(0, static_cast<int>(cinfo.output_width),
+                                              static_cast<int>(cinfo.output_height), 24,
+                                              SDL_PIXELFORMAT_RGB24);
+    if (!surface)
+        longjmp(jerr.jmp, 1);
+
+    while (cinfo.output_scanline < cinfo.output_height)
+    {
+        JSAMPROW row = static_cast<Uint8 *>(surface->pixels) +
+                       static_cast<size_t>(cinfo.output_scanline) * surface->pitch;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return surface;
+}
+
 // ---------------------------------------------------------------- IMG_Load_RW (real)
 SDL_Surface *IMG_Load_RW(SDL_RWops *src, int freesrc)
 {

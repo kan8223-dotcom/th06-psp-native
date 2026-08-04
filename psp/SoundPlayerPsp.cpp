@@ -85,20 +85,16 @@ static const char *const g_SFXList[26] = {
 
 namespace
 {
-// A TH06 BGM is 44.1 kHz stereo s16 (176,400 bytes/s).  Real PSP measurements
-// put sequential 64 KiB reads at 17--242 ms, and the 2026-08-04 real run saw
-// a 296 ms maximum while using 128 KiB blocks.  Two 192 KiB blocks retain
-// about 2.23 s and reduce how often the producer enters FAT I/O.  This is a
-// bounded 128 KiB increase: the same run reported 700 KiB total free after
-// stage setup.  It does not pretend to eliminate the stall--that requires
-// moving prefetch off the mixer thread--but it is useful headroom meanwhile.
-constexpr u32 kBgmCacheFrames = 48 * 1024;
-constexpr u32 kBgmPrefetchFrames = 32 * 1024;
+// A TH06 BGM is 44.1 kHz stereo s16 (176,400 bytes/s).  Six 64 KiB blocks keep
+// the existing 384 KiB allocation (about 2.23 s) but let the I/O worker refill
+// a consumed block almost two seconds before playback needs it.  64 KiB is
+// also the transfer size for which the real-PSP latency record exists.
+constexpr u32 kBgmCacheFrames = 16 * 1024;
+constexpr int kBgmCacheBlockCount = 6;
 constexpr u32 kMaxMixSamples = 2048; // 1024 stereo frames per worker pass
 
 struct BgmCacheBlock
 {
-    alignas(64) i16 pcm[kBgmCacheFrames * 2];
     u32 startFrame;
     u32 frames;
     u32 requestedStartFrame;
@@ -118,13 +114,15 @@ struct PspBgmStream
     SDL_RWops *file;
     u32 dataOffset;
     u32 dataBytes;
-    BgmCacheBlock blocks[2];
+    alignas(64) i16 pcm[kBgmCacheBlockCount][kBgmCacheFrames * 2];
+    BgmCacheBlock blocks[kBgmCacheBlockCount];
     volatile u32 generation;
     u32 fills;
     u32 shortReads;
 };
 
 PspBgmStream gBgmStream{};
+static_assert(sizeof(gBgmStream.pcm) == 384 * 1024, "BGM cache RAM budget changed");
 alignas(64) i16 gFinalMix[kMaxMixSamples];
 #ifndef TH06_PSP
 alignas(64) i32 gWideMix[kMaxMixSamples];
@@ -135,6 +133,9 @@ volatile u32 gPspAudioMaxProducerGapUs;
 volatile u32 gPspAudioMaxMixUs;
 volatile u32 gPspAudioMaxBgmReadUs;
 volatile u32 gPspAudioMixCalls;
+volatile u32 gPspBgmReadCount;
+volatile u32 gPspBgmCacheMissPasses;
+volatile u32 gPspBgmCacheMissFrames;
 SceUID gBgmPrefetchSema = -1;
 SceUID gBgmPrefetchThread = -1;
 volatile bool gBgmPrefetchAlive;
@@ -189,7 +190,7 @@ void CloseBgmUnlocked(SoundPlayer *player)
 
 bool FillBgmBlockLocked(int index, u32 startFrame, u32 generation)
 {
-    if (!BgmIsOpen() || index < 0 || index > 1 ||
+    if (!BgmIsOpen() || index < 0 || index >= kBgmCacheBlockCount ||
         generation != __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE) ||
         startFrame >= gBgmStream.dataBytes / 4)
         return false;
@@ -200,6 +201,7 @@ bool FillBgmBlockLocked(int index, u32 startFrame, u32 generation)
     const u32 requestedBytes = requestedFrames * 4;
 #ifdef TH06_PSP
     const u64 readStartUs = sceKernelGetSystemTimeWide();
+    __atomic_fetch_add(&gPspBgmReadCount, 1u, __ATOMIC_RELAXED);
 #endif
     if (SDL_RWseek(gBgmStream.file, gBgmStream.dataOffset + startFrame * 4, RW_SEEK_SET) < 0)
     {
@@ -209,7 +211,8 @@ bool FillBgmBlockLocked(int index, u32 startFrame, u32 generation)
 #endif
         return false;
     }
-    const u32 bytesRead = static_cast<u32>(SDL_RWread(gBgmStream.file, block.pcm, 1, requestedBytes));
+    const u32 bytesRead =
+        static_cast<u32>(SDL_RWread(gBgmStream.file, gBgmStream.pcm[index], 1, requestedBytes));
 #ifdef TH06_PSP
     RecordPspAudioMaximum(&gPspAudioMaxBgmReadUs,
                           static_cast<u32>(sceKernelGetSystemTimeWide() - readStartUs));
@@ -219,7 +222,7 @@ bool FillBgmBlockLocked(int index, u32 startFrame, u32 generation)
         return false;
 #ifdef TH06_PSP
     // ME reads the physical backing store, not the SC's dirty cache lines.
-    sceKernelDcacheWritebackRange(block.pcm, framesRead * 4);
+    sceKernelDcacheWritebackRange(gBgmStream.pcm[index], framesRead * 4);
 #endif
     block.startFrame = startFrame;
     block.frames = framesRead;
@@ -251,7 +254,7 @@ int BgmPrefetchThread(SceSize, void *)
         if (!__atomic_load_n(&gBgmPrefetchAlive, __ATOMIC_ACQUIRE))
             break;
 
-        for (int index = 0; index < 2; ++index)
+        for (int index = 0; index < kBgmCacheBlockCount; ++index)
         {
             BgmCacheBlock &block = gBgmStream.blocks[index];
             if (__atomic_load_n(&block.state, __ATOMIC_ACQUIRE) != BGM_CACHE_FILLING)
@@ -277,11 +280,15 @@ bool StartBgmPrefetchThread()
 {
     if (gBgmPrefetchThread >= 0)
         return true;
-    gBgmPrefetchSema = sceKernelCreateSema("th06_bgm_io_sem", 0, 0, 2, nullptr);
+    gBgmPrefetchSema =
+        sceKernelCreateSema("th06_bgm_io_sem", 0, 0, kBgmCacheBlockCount, nullptr);
     if (gBgmPrefetchSema < 0)
         return false;
     __atomic_store_n(&gBgmPrefetchAlive, true, __ATOMIC_RELEASE);
-    gBgmPrefetchThread = sceKernelCreateThread("th06_bgm_io", BgmPrefetchThread, 0x30, 0x4000,
+    // PSP priorities increase numerically as urgency decreases.  Keep storage
+    // below the DAC (0x10) and mixer (0x18), but above the game main thread
+    // (0x20) so a draw-heavy frame cannot starve read-ahead indefinitely.
+    gBgmPrefetchThread = sceKernelCreateThread("th06_bgm_io", BgmPrefetchThread, 0x1c, 0x4000,
                                                 PSP_THREAD_ATTR_USER, nullptr);
     if (gBgmPrefetchThread < 0 || sceKernelStartThread(gBgmPrefetchThread, 0, nullptr) < 0)
     {
@@ -311,7 +318,7 @@ void StopBgmPrefetchThread()
 
 int FindBgmBlock(u32 frame)
 {
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < kBgmCacheBlockCount; ++i)
     {
         const BgmCacheBlock &block = gBgmStream.blocks[i];
         if (__atomic_load_n(&block.state, __ATOMIC_ACQUIRE) == BGM_CACHE_READY &&
@@ -334,9 +341,28 @@ bool BgmFillAlreadyQueued(u32 frame)
     return false;
 }
 
+int FindBgmBlockOrQueued(u32 frame)
+{
+    const int ready = FindBgmBlock(frame);
+    if (ready >= 0)
+        return ready;
+
+    const u32 generation = __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < kBgmCacheBlockCount; ++i)
+    {
+        const BgmCacheBlock &block = gBgmStream.blocks[i];
+        if (__atomic_load_n(&block.state, __ATOMIC_ACQUIRE) == BGM_CACHE_FILLING &&
+            block.requestedGeneration == generation && frame >= block.requestedStartFrame &&
+            frame < block.requestedStartFrame + kBgmCacheFrames)
+            return i;
+    }
+    return -1;
+}
+
 bool RequestBgmBlock(int index, u32 startFrame)
 {
-    if (!BgmIsOpen() || index < 0 || index > 1 || startFrame >= gBgmStream.dataBytes / 4)
+    if (!BgmIsOpen() || index < 0 || index >= kBgmCacheBlockCount ||
+        startFrame >= gBgmStream.dataBytes / 4)
         return false;
     BgmCacheBlock &block = gBgmStream.blocks[index];
     if (__atomic_load_n(&block.state, __ATOMIC_ACQUIRE) == BGM_CACHE_FILLING)
@@ -363,7 +389,7 @@ int AcquireBgmBlock(u32 frame, u32 protectedBlocks)
     // mixer. Queue a safe block and let this pass emit silence for the missing
     // tail. protectedBlocks contains PCM already handed to the current ME job.
     int replace = -1;
-    for (int candidate = 0; candidate < 2; ++candidate)
+    for (int candidate = 0; candidate < kBgmCacheBlockCount; ++candidate)
     {
         if ((protectedBlocks & (1u << candidate)) == 0 &&
             __atomic_load_n(&gBgmStream.blocks[candidate].state, __ATOMIC_ACQUIRE) != BGM_CACHE_FILLING)
@@ -377,21 +403,74 @@ int AcquireBgmBlock(u32 frame, u32 protectedBlocks)
     return -1;
 }
 
-void PrefetchBgmAfter(SoundPlayer *player, int currentBlock, u32 position, u32 protectedBlocks)
+void MaintainBgmReadAhead(SoundPlayer *player, u32 position, u32 protectedBlocks)
 {
-    if (currentBlock < 0)
+    if (!BgmIsOpen() || position >= player->backgroundMusic.loopEnd ||
+        player->backgroundMusic.loopStart >= player->backgroundMusic.loopEnd)
         return;
-    const BgmCacheBlock &block = gBgmStream.blocks[currentBlock];
-    const u32 end = block.startFrame + block.frames;
-    const u32 playbackEnd = std::min(end, player->backgroundMusic.loopEnd);
-    if (position > playbackEnd || playbackEnd - position > kBgmPrefetchFrames)
-        return;
-    const u32 next = end < player->backgroundMusic.loopEnd ? end : player->backgroundMusic.loopStart;
-    if (FindBgmBlock(next) >= 0 || BgmFillAlreadyQueued(next))
-        return;
-    const int targetBlock = currentBlock ^ 1;
-    if ((protectedBlocks & (1u << targetBlock)) == 0)
-        RequestBgmBlock(targetBlock, next);
+
+    // First describe the six-block playback window and protect every existing
+    // member.  Computing the complete keep mask before replacement prevents a
+    // hole near the front from evicting a valid block farther ahead.
+    u32 desiredStarts[kBgmCacheBlockCount]{};
+    bool missing[kBgmCacheBlockCount]{};
+    u32 keepBlocks = protectedBlocks;
+    u32 cursor = position;
+    int desiredCount = 0;
+    for (; desiredCount < kBgmCacheBlockCount; ++desiredCount)
+    {
+        desiredStarts[desiredCount] = cursor;
+        const int index = FindBgmBlockOrQueued(cursor);
+        u32 blockEnd = 0;
+        if (index >= 0)
+        {
+            keepBlocks |= 1u << index;
+            const BgmCacheBlock &block = gBgmStream.blocks[index];
+            const u32 state = __atomic_load_n(&block.state, __ATOMIC_ACQUIRE);
+            const u32 start = state == BGM_CACHE_READY ? block.startFrame : block.requestedStartFrame;
+            const u32 frames = state == BGM_CACHE_READY
+                                   ? block.frames
+                                   : std::min(kBgmCacheFrames, gBgmStream.dataBytes / 4 - start);
+            blockEnd = start + frames;
+        }
+        else
+        {
+            missing[desiredCount] = true;
+            blockEnd = cursor +
+                       std::min(kBgmCacheFrames, gBgmStream.dataBytes / 4 - cursor);
+        }
+
+        const u32 playbackEnd = std::min(blockEnd, player->backgroundMusic.loopEnd);
+        if (playbackEnd <= cursor)
+            break;
+        const u32 next = playbackEnd < player->backgroundMusic.loopEnd
+                             ? playbackEnd
+                             : player->backgroundMusic.loopStart;
+        if (next == position)
+            break;
+        cursor = next;
+    }
+
+    for (int desired = 0; desired <= desiredCount && desired < kBgmCacheBlockCount; ++desired)
+    {
+        if (!missing[desired] || FindBgmBlockOrQueued(desiredStarts[desired]) >= 0)
+            continue;
+
+        int replace = -1;
+        for (int candidate = 0; candidate < kBgmCacheBlockCount; ++candidate)
+        {
+            if ((keepBlocks & (1u << candidate)) == 0 &&
+                __atomic_load_n(&gBgmStream.blocks[candidate].state, __ATOMIC_ACQUIRE) !=
+                    BGM_CACHE_FILLING)
+            {
+                replace = candidate;
+                break;
+            }
+        }
+        if (replace < 0 || !RequestBgmBlock(replace, desiredStarts[desired]))
+            break;
+        keepBlocks |= 1u << replace;
+    }
 }
 } // namespace
 
@@ -507,6 +586,7 @@ ZunResult SoundPlayer::LoadWav(const char *path)
     u32 riffSize;
     u32 wavDataSize;
     u32 dataOffset;
+    u32 initialStart = 0;
     bool firstBlockReady = false;
     Th06PspHeapSnapshot heap;
 
@@ -629,9 +709,9 @@ ZunResult SoundPlayer::LoadWav(const char *path)
 
     dataOffset = static_cast<u32>(SDL_RWtell(fileStream));
 
-    // Keep the file open and publish two fixed read-ahead blocks.  srcWav.data
-    // is only a non-null compatibility sentinel; PSP mixing never dereferences
-    // it and never allocates wavDataSize bytes.
+    // Keep the file open and publish the fixed six-block read-ahead window.
+    // srcWav.data is only a non-null compatibility sentinel; PSP mixing never
+    // dereferences it and never allocates wavDataSize bytes.
     this->soundBufMutex.lock();
     gBgmFileMutex.lock();
     gBgmStream.file = fileStream;
@@ -647,9 +727,21 @@ ZunResult SoundPlayer::LoadWav(const char *path)
         block.requestedGeneration = 0;
         __atomic_store_n(&block.state, BGM_CACHE_EMPTY, __ATOMIC_RELEASE);
     }
+    // Two blocks (about 743 ms) are ready before playback begins.  The other
+    // four are filled by the dedicated worker, shortening the stage-load I/O
+    // burst while retaining the same 384 KiB steady-state read-ahead window.
     firstBlockReady = FillBgmBlockNow(0, 0);
-    if (firstBlockReady)
-        FillBgmBlockNow(1, gBgmStream.blocks[0].frames);
+    initialStart = firstBlockReady ? gBgmStream.blocks[0].frames : 0;
+    if (firstBlockReady && initialStart < gBgmStream.dataBytes / 4 &&
+        FillBgmBlockNow(1, initialStart))
+        initialStart += gBgmStream.blocks[1].frames;
+    for (int index = 2; firstBlockReady && index < kBgmCacheBlockCount &&
+                        initialStart < gBgmStream.dataBytes / 4;
+         ++index)
+    {
+        RequestBgmBlock(index, initialStart);
+        initialStart += std::min(kBgmCacheFrames, gBgmStream.dataBytes / 4 - initialStart);
+    }
     gBgmFileMutex.unlock();
     if (!firstBlockReady)
     {
@@ -669,7 +761,7 @@ ZunResult SoundPlayer::LoadWav(const char *path)
     heap = th06_psp_heap_snapshot();
     th06_psp_boot_notef("BGM OPEN %s %luKB C%luKB H%u/%uKB", path,
                         static_cast<unsigned long>(wavDataSize / 1024),
-                        static_cast<unsigned long>(sizeof(gBgmStream.blocks) / 1024),
+                        static_cast<unsigned long>(sizeof(gBgmStream.pcm) / 1024),
                         heap.usedBytes / 1024u, heap.freeBytes / 1024u);
 
     return ZUN_SUCCESS;
@@ -1048,6 +1140,11 @@ void SoundPlayer::MixAudio(u32 samples)
             const int blockIndex = AcquireBgmBlock(this->backgroundMusic.pos, protectedBgmBlocks);
             if (blockIndex < 0)
             {
+#ifdef TH06_PSP
+                __atomic_fetch_add(&gPspBgmCacheMissPasses, 1u, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&gPspBgmCacheMissFrames, (samples / 2) - samplesMixed,
+                                   __ATOMIC_RELAXED);
+#endif
                 break;
             }
             const BgmCacheBlock &block = gBgmStream.blocks[blockIndex];
@@ -1055,7 +1152,7 @@ void SoundPlayer::MixAudio(u32 samples)
             const u32 blockFrames = block.frames - blockOffset;
             const u32 loopFrames = this->backgroundMusic.loopEnd - this->backgroundMusic.pos;
             const u32 samplesToMix = std::min((samples / 2) - samplesMixed, std::min(blockFrames, loopFrames));
-            const i16 *bgm = block.pcm + static_cast<size_t>(blockOffset) * 2;
+            const i16 *bgm = gBgmStream.pcm[blockIndex] + static_cast<size_t>(blockOffset) * 2;
             // samplesMixed counts frames; a descriptor preserves that output
             // offset while avoiding all per-sample work on SC when ME is on.
 #ifdef TH06_PSP
@@ -1073,7 +1170,6 @@ void SoundPlayer::MixAudio(u32 samples)
 
             this->backgroundMusic.pos += samplesToMix;
             samplesMixed += samplesToMix;
-            PrefetchBgmAfter(this, blockIndex, this->backgroundMusic.pos, protectedBgmBlocks);
 
             if (this->backgroundMusic.pos == this->backgroundMusic.loopEnd)
             {
@@ -1087,6 +1183,8 @@ void SoundPlayer::MixAudio(u32 samples)
                     break;
                 }
             }
+            if (BgmIsOpen())
+                MaintainBgmReadAhead(this, this->backgroundMusic.pos, protectedBgmBlocks);
         }
 
         if (this->backgroundMusic.fadeoutLen != 0 && BgmIsOpen())
@@ -1167,10 +1265,25 @@ extern "C" void th06_psp_sound_diag_window(unsigned int *maxProducerGapUs, unsig
         *maxProducerGapUs = __atomic_exchange_n(&gPspAudioMaxProducerGapUs, 0, __ATOMIC_ACQ_REL);
     if (maxMixUs)
         *maxMixUs = __atomic_exchange_n(&gPspAudioMaxMixUs, 0, __ATOMIC_ACQ_REL);
+    // BGM I/O owns a separate window so reads and cache misses are reset as
+    // one coherent sample.  Keep this argument for source compatibility.
     if (maxBgmReadUs)
-        *maxBgmReadUs = __atomic_exchange_n(&gPspAudioMaxBgmReadUs, 0, __ATOMIC_ACQ_REL);
+        *maxBgmReadUs = 0;
     if (mixCalls)
         *mixCalls = __atomic_exchange_n(&gPspAudioMixCalls, 0, __ATOMIC_ACQ_REL);
+}
+
+extern "C" void th06_psp_bgm_diag_window(unsigned int *reads, unsigned int *maxReadUs,
+                                           unsigned int *missPasses, unsigned int *missFrames)
+{
+    if (reads)
+        *reads = __atomic_exchange_n(&gPspBgmReadCount, 0, __ATOMIC_ACQ_REL);
+    if (maxReadUs)
+        *maxReadUs = __atomic_exchange_n(&gPspAudioMaxBgmReadUs, 0, __ATOMIC_ACQ_REL);
+    if (missPasses)
+        *missPasses = __atomic_exchange_n(&gPspBgmCacheMissPasses, 0, __ATOMIC_ACQ_REL);
+    if (missFrames)
+        *missFrames = __atomic_exchange_n(&gPspBgmCacheMissFrames, 0, __ATOMIC_ACQ_REL);
 }
 #endif
 

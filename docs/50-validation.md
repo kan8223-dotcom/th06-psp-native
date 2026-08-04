@@ -679,3 +679,28 @@ NaNをGEへ渡さないため削除しない。
   `0b11919fe97e73ff88038fb928488e69adbba9ad773f11834954c12bca80a27c`。G:へ転送後のSHA-256一致を確認。
   PSP-3000実機のFPS差と
   PSP-1000実機のVFPU/alignment挙動は未測定であり、PPSSPP結果を実機性能値として扱わない。
+
+## V-027 GE command削減、BGM六分割先読み、game-over result予選 (2026-08-04)
+
+- PSP-3000実機でstage 5死亡後にContinue「No」を選んだrunは、最後の記録が
+  `BGM CLOSE R33 S0`だった。BGM closeは完了しており、その後のGameManager破棄から
+  ResultScreen登録までが未観測だったため、各破棄処理、result surface、result ANM 4本を
+  begin/endで囲んだ。音声は通常5秒窓をRAM flight recorderへ蓄積し、Continue/面遷移/HOME/
+  watchdog時だけ`AUD!`一行へ確定する。ME timeoutのmixer hot pathからFAT書込みも除いた。
+- `RESULT_SOAK=1`は通常録画gameを開始し、300frame後に実際の
+  `SUPERVISOR_STATE_RESULTSCREEN_FROMGAME`へ入るPPSSPP専用test。最初のtestはtitle updateを
+  省いたためTL archiveが無く、`result.jpg`不在という偽陽性になった。TL archiveを通常pathと
+  同じく開くよう修正後、game teardown全工程、`result.jpg`、`result00..03.anm`、
+  `RESULT REGISTER END R0`まで完走した。証拠は
+  `backups/PPSSPP_RESULT_CONTINUE_NO_RGB24_20260804.LOG`。
+- 640x480 JPEG surfaceは旧pathでRGBA 1.2MiBとRGB24 0.9MiBを同時確保していた。PSP wrapperは
+  libjpegから最終RGB24へ直接scanline decodeし、SDL surfaceのcalloc失敗もNULLで返す。
+  result surface登録時に必要なheap arena増加はPPSSPP 32MBで約2.1MiBから約0.9MiBへ減った。
+- GE backendは同一texture/color stateの再発行を省き、通常UV頂点を24 bytesから20 bytesへ縮小。
+  draw直前のdcache writeback契約は維持した。BGMは総量384KiBのまま192KiB×2から64KiB×6へ変更し、
+  I/O workerをpriority `0x1c`へ上げ、曲開始同期readを384KiBから128KiBへ減らした。
+- 通常EBOOTのPPSSPP v1.20.4 / `PSPModel=0`回帰はDAT 6本、font、title BGM、TL archive、
+  60frame提示まで完走。証拠は`backups/PPSSPP_NORMAL_32MB_PARALLEL_OPT_20260804.LOG`。
+  preflightは違反0/警告0、release auditは原作data/replay/score混入0件。通常EBOOTは
+  3,015,542 bytes / SHA-256 `3f31fa097ba11e2036e91d2ccb6a5e02a9b10dcd3b947300295fbc0060f0da2f`。
+  G:は配達開始時にmedia disconnectし、実機配達と3D背景/BGM/resultの実機確認は未完了。
