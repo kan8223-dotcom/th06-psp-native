@@ -703,4 +703,6 @@ NaNをGEへ渡さないため削除しない。
   60frame提示まで完走。証拠は`backups/PPSSPP_NORMAL_32MB_PARALLEL_OPT_20260804.LOG`。
   preflightは違反0/警告0、release auditは原作data/replay/score混入0件。通常EBOOTは
   3,015,542 bytes / SHA-256 `3f31fa097ba11e2036e91d2ccb6a5e02a9b10dcd3b947300295fbc0060f0da2f`。
-  G:は配達開始時にmedia disconnectし、実機配達と3D背景/BGM/resultの実機確認は未完了。
+  G:は最初の配達中にmedia disconnectしたが、C:へ退避した同一EBOOTを`EBOOT.NEW`へ全量copyし、
+  SHA-256一致後に`EBOOT.PBP`へ置換して復旧した。G:上の3,015,542 bytesと上記SHA-256は一致。
+  3D背景/BGM/resultの本版による実機確認は未完了。
