@@ -338,7 +338,10 @@ int EscapeThread(SceSize, void *)
             // STALL was captured immediately above.  HOME/COMBO need the same
             // last-moment RAM snapshot before the process leaves.
             if (exitReason != 3)
+            {
+                th06_psp_ge_diag_checkpoint(name);
                 th06_psp_audio_diag_checkpoint(name, 1);
+            }
             th06_psp_boot_notef("EXIT REQUEST %s F%u", name, frames);
             sceKernelExitGame();
             th06_psp_boot_notef("EXIT CALL RETURNED %s", name);

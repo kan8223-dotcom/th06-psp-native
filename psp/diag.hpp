@@ -54,6 +54,10 @@ extern "C"
     // ME timeout.
     void th06_psp_audio_diag_checkpoint(const char *tag, int always);
 
+    // GE timing is likewise retained in RAM and written only while leaving
+    // the application, never in the rendering or streaming hot path.
+    void th06_psp_ge_diag_checkpoint(const char *tag);
+
     // -------------------------------------------------------------- watchdog
     // Boot only.  A boot that stops making progress reports its last note and
     // returns to the XMB instead of forcing a hardware shutdown.

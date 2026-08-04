@@ -17,3 +17,10 @@ extern "C" int th06_psp_verbose_transition_diag();
 // GE present path when its matching 300-frame PERF window closes.
 extern "C" void th06_psp_cpu_perf_window(unsigned long long *calcUs, unsigned long long *drawUs,
                                           unsigned int *calcCalls, unsigned int *drawCalls);
+
+// Independent 60-frame RAM flight recorder.  It never writes during play;
+// the GE backend consumes and resets it when publishing a candidate window.
+extern "C" void th06_psp_cpu_perf_flight_window(unsigned long long *calcUs, unsigned long long *drawUs);
+
+// Cumulative PSP bullet-render shortcut counts, sampled only on exit.
+extern "C" void th06_psp_bullet_fast_stats(unsigned int *fastDraws, unsigned int *fallbackDraws);

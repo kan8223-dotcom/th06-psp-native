@@ -31,13 +31,19 @@ PSP_FW_VERSION := 660
 BUILD_PRX := 0
 EXTRA_TARGETS := EBOOT.PBP
 
-CXXFLAGS := -std=gnu++17 -O2 -G0 -Wall -Wextra -Wno-unused-parameter \
+CXXFLAGS := -std=gnu++17 -O2 -G0 -march=allegrex -mtune=allegrex -Wall -Wextra -Wno-unused-parameter \
             -fno-exceptions -fno-rtti -fno-pic -DPSP -DTH06_PSP \
             -DGAME_WINDOW_WIDTH_REAL=480 -DGAME_WINDOW_HEIGHT_REAL=272 \
             -Ipsp -Ishim -Ishim/cxxcompat -Isrc -I/usr/local/pspdev/psp/include/freetype2 \
             -include psp/cxxcompat/minmax.hpp -include psp/platform_hooks.hpp
-CFLAGS := -O2 -G0 -Wall -Wextra -fno-pic \
+CFLAGS := -O2 -G0 -march=allegrex -mtune=allegrex -Wall -Wextra -fno-pic \
           -Ipsp -Ipsp/third_party/me-custom-core
+
+# These three translation units account for the measured stage/background and
+# sprite draw time.  Keep IEEE/NaN behaviour intact (real PSP has already
+# exposed invalid-float paths that PPSSPP tolerated), but let GCC perform the
+# more aggressive inlining and loop optimisation that is safe at -O3.
+src/AnmManager.o src/BulletManager.o src/Stage.o: CXXFLAGS += -O3 -funroll-loops
 ifeq ($(BOOT_PROBE),1)
 CXXFLAGS += -DTH06_PSP_BOOT_PROBE
 PSP_EBOOT_TITLE := TH06 PSP boot probe
@@ -81,9 +87,10 @@ CXXFLAGS += -DTH06_PSP_PS3_REPLAY
 PSP_EBOOT_TITLE := Touhou 6 PSP PS3 replay
 endif
 LIBS := -L$(MECC_BUILD_DIR) -lme-core \
-        -lpspgum_vfpu -lpspvfpu -lpspgu -lpspdisplay -lpspctrl -lpsppower -lpspaudio \
+        -lpspgum_vfpu -lpspvfpu -lpspmath -lpspgu -lpspdisplay -lpspctrl -lpsppower -lpspaudio \
         -lfreetype -lbz2 -lpng16 -ljpeg -lz -lm -lstdc++ -lsupc++ -lpspsdk \
         -Wl,--wrap=fopen -Wl,--wrap=_Znwj \
+        -Wl,--wrap=sinf -Wl,--wrap=cosf -Wl,--wrap=rintf \
         -Wl,--wrap=_ZN11Pbg3Archive4LoadEPKc \
         -Wl,--wrap=_ZN11Pbg3Archive19ReadDecompressEntryEmPKc \
         -Wl,--wrap=_ZN5Chain12RunCalcChainEv \
@@ -125,6 +132,9 @@ LIBS := -L$(MECC_BUILD_DIR) -lme-core \
         -Wl,--wrap=_ZN12EnemyManager8OnUpdateEPS_ \
         -Wl,--wrap=_ZN13EffectManager8OnUpdateEPS_ \
         -Wl,--wrap=_ZN13EffectManager6OnDrawEPS_ \
+        -Wl,--wrap=_ZN13BulletManager6OnDrawEPS_ \
+        -Wl,--wrap=_ZN10AnmManager4DrawEPK5AnmVm \
+        -Wl,--wrap=_ZN10AnmManager5Draw2EPK5AnmVm \
         -Wl,--wrap=_ZN13ReplayManager13RegisterChainElPKc \
         -Wl,--wrap=_ZN10Controller8GetInputEv \
         -Wl,--wrap=_ZN10Supervisor10LoadConfigEPKc \

@@ -4,6 +4,7 @@
 #include "memory.hpp"
 
 #include <pspkernel.h>
+#include <pspmath.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <SDL2/SDL_surface.h>
 
 #include "AnmManager.hpp"
+#include "AnmIdx.hpp"
 #include "BulletManager.hpp"
 #include "Chain.hpp"
 #include "AsciiManager.hpp"
@@ -51,6 +53,11 @@ unsigned long long gPerfCalcUs;
 unsigned long long gPerfDrawUs;
 unsigned int gPerfCalcCalls;
 unsigned int gPerfDrawCalls;
+unsigned long long gPerfFlightCalcUs;
+unsigned long long gPerfFlightDrawUs;
+volatile unsigned int gBulletRenderMath;
+volatile unsigned int gBulletFastDraws;
+volatile unsigned int gBulletFallbackDraws;
 unsigned int gReplayCompactedBytes;
 
 // Real-hardware stage changes used to stop in EclManager::Unload(), inside
@@ -67,6 +74,7 @@ EclRawInstr *gPspEclSubTable[kPspEclMaxSubs];
 unsigned int gPspEclLoadedBytes;
 unsigned int gMassBulletPopupStride;
 unsigned int gMassBulletPopupIndex;
+Bullet *gPspBulletDrawBuckets[4][640];
 
 long CurrentStackFreeKb()
 {
@@ -80,6 +88,209 @@ unsigned int FloatBits(float value)
     static_assert(sizeof(bits) == sizeof(value), "float bit log expects 32-bit float");
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
+}
+
+float FastRenderRint(float value)
+{
+    float result;
+    asm volatile("round.w.s %0, %1\n\t"
+                 "cvt.s.w %0, %0"
+                 : "=&f"(result)
+                 : "f"(value));
+    return result;
+}
+
+bool CanFastRenderRint(float value)
+{
+    return std::isfinite(value) && value >= -32768.0f && value <= 32767.0f;
+}
+
+bool IsSimpleSpriteMatrix(const ZunMatrix &matrix)
+{
+    // Draw/Draw2 overwrite translation, and their ZunVec3 multiply ignores
+    // the fourth column.  The remaining six off-diagonal terms are the only
+    // ones that would prevent the PSP sprite shortcut below.
+    return matrix.m[1][0] == 0.0f && matrix.m[2][0] == 0.0f &&
+           matrix.m[0][1] == 0.0f && matrix.m[2][1] == 0.0f &&
+           matrix.m[0][2] == 0.0f && matrix.m[1][2] == 0.0f;
+}
+
+void WriteBulletVertex(VertexTex1Xyzrhw &dst, float x, float y, float z, float u, float v)
+{
+    dst.position.x = x;
+    dst.position.y = y;
+    dst.position.z = z;
+    dst.position.w = 1.0f;
+    dst.textureUV.x = u;
+    dst.textureUV.y = v;
+}
+
+void AppendBulletQuad(AnmManager *manager, const AnmVm *vm, const float *x, const float *y)
+{
+    // State setters flush only when their value actually changes.  Calling
+    // them here preserves the engine's ordering while consecutive bullets
+    // with the same texture/color/blend remain one batch.
+    manager->SetCurrentTexture(manager->textures[vm->sprite->sourceFileIndex].handle);
+    manager->SetVertexAttributes(VERTEX_ATTR_TEX_COORD);
+    manager->SetRenderStateForVm(vm);
+
+    if (manager->vertexBufferEndPtr + 6 > manager->vertexBuffer + 0x18000)
+        manager->FlushVertexBuffer();
+
+    VertexTex1Xyzrhw *dst = manager->vertexBufferEndPtr;
+    const float u0 = vm->sprite->uvStart.x + vm->uvScrollPos.x;
+    const float u1 = vm->sprite->uvEnd.x + vm->uvScrollPos.x;
+    const float v0 = vm->sprite->uvStart.y + vm->uvScrollPos.y;
+    const float v1 = vm->sprite->uvEnd.y + vm->uvScrollPos.y;
+    const float z = vm->pos.z;
+
+    // Emit the final two triangles directly.  The inherited path first made
+    // four temporary vertices and then copied three whole structs twice.
+    WriteBulletVertex(dst[0], x[0], y[0], z, u0, v0);
+    WriteBulletVertex(dst[1], x[1], y[1], z, u1, v0);
+    WriteBulletVertex(dst[2], x[2], y[2], z, u0, v1);
+    WriteBulletVertex(dst[3], x[1], y[1], z, u1, v0);
+    WriteBulletVertex(dst[4], x[2], y[2], z, u0, v1);
+    WriteBulletVertex(dst[5], x[3], y[3], z, u1, v1);
+    manager->vertexBufferEndPtr += 6;
+    ++manager->spritesToDraw;
+
+    // AnmManager's generic path caches UVs in a private TU-local temporary.
+    // It was deliberately bypassed above, so force the next non-bullet draw
+    // to refresh that temporary rather than trusting stale UVs.
+    manager->currentSprite = nullptr;
+}
+
+bool BulletQuadOutsideViewport(const float *x, const float *y)
+{
+    float minX = x[0];
+    float maxX = x[0];
+    float minY = y[0];
+    float maxY = y[0];
+    for (int i = 1; i < 4; ++i)
+    {
+        minX = std::min(minX, x[i]);
+        maxX = std::max(maxX, x[i]);
+        minY = std::min(minY, y[i]);
+        maxY = std::max(maxY, y[i]);
+    }
+    const ZunViewport &viewport = g_Supervisor.viewport;
+    return maxX < viewport.x || maxY < viewport.y ||
+           minX > viewport.x + viewport.width || minY > viewport.y + viewport.height;
+}
+
+bool FastBulletOrthographicDraw(AnmManager *manager, const AnmVm *vm)
+{
+    if (!manager || !vm || !vm->sprite || !vm->flags.isVisible || !vm->flags.flag1 || vm->color == 0)
+        return false;
+    if (vm->rotation.x != 0.0f || vm->rotation.y != 0.0f ||
+        !std::isfinite(vm->rotation.z) || !std::isfinite(vm->pos.x) ||
+        !std::isfinite(vm->pos.y) || !std::isfinite(vm->pos.z) ||
+        !std::isfinite(vm->scaleX) || !std::isfinite(vm->scaleY))
+        return false;
+    if (((g_Supervisor.cfg.opts >> GCOS_DONT_USE_VERTEX_BUF) & 1) != 0)
+        return false;
+
+    float x[4];
+    float y[4];
+    if (vm->rotation.z == 0.0f)
+    {
+        const float halfWidth = vm->sprite->widthPx * vm->scaleX * 0.5f;
+        const float halfHeight = vm->sprite->heightPx * vm->scaleY * 0.5f;
+        const float rawLeft = (vm->flags.anchor & AnmVmAnchor_Left) ? vm->pos.x : vm->pos.x - halfWidth;
+        const float rawRight = (vm->flags.anchor & AnmVmAnchor_Left) ? vm->pos.x + halfWidth * 2.0f
+                                                                     : vm->pos.x + halfWidth;
+        const float rawTop = (vm->flags.anchor & AnmVmAnchor_Top) ? vm->pos.y : vm->pos.y - halfHeight;
+        const float rawBottom = (vm->flags.anchor & AnmVmAnchor_Top) ? vm->pos.y + halfHeight * 2.0f
+                                                                     : vm->pos.y + halfHeight;
+        if (!CanFastRenderRint(rawLeft) || !CanFastRenderRint(rawRight) ||
+            !CanFastRenderRint(rawTop) || !CanFastRenderRint(rawBottom))
+            return false;
+        const float left = FastRenderRint(rawLeft);
+        const float right = FastRenderRint(rawRight);
+        const float top = FastRenderRint(rawTop);
+        const float bottom = FastRenderRint(rawBottom);
+        x[0] = x[2] = left;
+        x[1] = x[3] = right;
+        y[0] = y[1] = top;
+        y[2] = y[3] = bottom;
+    }
+    else
+    {
+        if (vm->rotation.z < -16.0f * ZUN_PI || vm->rotation.z > 16.0f * ZUN_PI)
+            return false;
+        float sine;
+        float cosine;
+        vfpu_sincos(vm->rotation.z, &sine, &cosine);
+        const float rawHalfWidth = vm->sprite->widthPx * vm->scaleX * 0.5f;
+        const float rawHalfHeight = vm->sprite->heightPx * vm->scaleY * 0.5f;
+        if (!CanFastRenderRint(vm->pos.x) || !CanFastRenderRint(vm->pos.y) ||
+            !CanFastRenderRint(rawHalfWidth) || !CanFastRenderRint(rawHalfHeight))
+            return false;
+        const float xOffset = FastRenderRint(vm->pos.x);
+        const float yOffset = FastRenderRint(vm->pos.y);
+        const float halfWidth = FastRenderRint(rawHalfWidth);
+        const float halfHeight = FastRenderRint(rawHalfHeight);
+        const float localX[4] = {-halfWidth - 0.5f, halfWidth - 0.5f,
+                                 -halfWidth - 0.5f, halfWidth - 0.5f};
+        const float localY[4] = {-halfHeight - 0.5f, -halfHeight - 0.5f,
+                                  halfHeight - 0.5f, halfHeight - 0.5f};
+        for (int i = 0; i < 4; ++i)
+        {
+            x[i] = localX[i] * cosine + localY[i] * sine + xOffset;
+            y[i] = -localX[i] * sine + localY[i] * cosine + yOffset;
+            if (vm->flags.anchor & AnmVmAnchor_Left)
+                x[i] += halfWidth;
+            if (vm->flags.anchor & AnmVmAnchor_Top)
+                y[i] += halfHeight;
+        }
+    }
+
+    if (BulletQuadOutsideViewport(x, y))
+        return true;
+    manager->SetProjectionMode(PROJECTION_MODE_ORTHOGRAPHIC);
+    AppendBulletQuad(manager, vm, x, y);
+    return true;
+}
+
+bool FastBulletPerspectiveDraw(AnmManager *manager, const AnmVm *vm)
+{
+    if (!manager || !vm || !vm->sprite || !vm->flags.isVisible || !vm->flags.flag1 || vm->color == 0 ||
+        !IsSimpleSpriteMatrix(vm->matrix) || vm->rotation.x != 0.0f || vm->rotation.y != 0.0f ||
+        !std::isfinite(vm->rotation.z) || !std::isfinite(vm->pos.x) || !std::isfinite(vm->pos.y) ||
+        !std::isfinite(vm->pos.z) || !std::isfinite(vm->scaleX) || !std::isfinite(vm->scaleY) ||
+        ((g_Supervisor.cfg.opts >> GCOS_DONT_USE_VERTEX_BUF) & 1) != 0)
+        return false;
+    if (vm->rotation.z < -16.0f * ZUN_PI || vm->rotation.z > 16.0f * ZUN_PI)
+        return false;
+
+    if (!CanFastRenderRint(vm->pos.x) || !CanFastRenderRint(vm->pos.y))
+        return false;
+    float tx = FastRenderRint(vm->pos.x) - 0.5f;
+    float ty = -FastRenderRint(vm->pos.y) + 0.5f;
+    if (vm->flags.anchor & AnmVmAnchor_Left)
+        tx += vm->sprite->widthPx * vm->scaleX * 0.5f;
+    if (vm->flags.anchor & AnmVmAnchor_Top)
+        ty -= vm->sprite->heightPx * vm->scaleY * 0.5f;
+
+    float sine = 0.0f;
+    float cosine = 1.0f;
+    if (vm->rotation.z != 0.0f)
+        vfpu_sincos(vm->rotation.z, &sine, &cosine);
+    const float sx = vm->matrix.m[0][0] * vm->scaleX;
+    const float sy = vm->matrix.m[1][1] * -vm->scaleY;
+    float x[4];
+    float y[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        const float localX = manager->vertexBufferContents[i].position.x * sx;
+        const float localY = manager->vertexBufferContents[i].position.y * sy;
+        x[i] = localX * cosine - localY * sine + tx;
+        y[i] = localX * sine + localY * cosine + ty;
+    }
+    manager->SetProjectionMode(PROJECTION_MODE_PERSPECTIVE);
+    AppendBulletQuad(manager, vm, x, y);
+    return true;
 }
 
 bool BossDeathTracing()
@@ -168,6 +379,84 @@ void StabilizeReimuAHomingBullets(Player *player)
         }
     }
 }
+}
+
+extern "C" float __real_sinf(float value);
+extern "C" float __real_cosf(float value);
+extern "C" float __real_rintf(float value);
+
+extern "C" float __wrap_sinf(float value)
+{
+    if (__atomic_load_n(&gBulletRenderMath, __ATOMIC_RELAXED) != 0 && std::isfinite(value) &&
+        value >= -16.0f * ZUN_PI && value <= 16.0f * ZUN_PI)
+        return vfpu_sinf(value);
+    return __real_sinf(value);
+}
+
+extern "C" float __wrap_cosf(float value)
+{
+    if (__atomic_load_n(&gBulletRenderMath, __ATOMIC_RELAXED) != 0 && std::isfinite(value) &&
+        value >= -16.0f * ZUN_PI && value <= 16.0f * ZUN_PI)
+        return vfpu_cosf(value);
+    return __real_cosf(value);
+}
+
+extern "C" float __wrap_rintf(float value)
+{
+    // Screen-space bullet geometry is small and finite.  Keep the generic
+    // newlib path for every other caller and for any corrupted/out-of-range
+    // input so the PSP FPU can never see the invalid conversion traps already
+    // encountered during bring-up.
+    if (__atomic_load_n(&gBulletRenderMath, __ATOMIC_RELAXED) != 0 && std::isfinite(value) &&
+        value >= -32768.0f && value <= 32767.0f)
+        return FastRenderRint(value);
+    return __real_rintf(value);
+}
+
+extern "C" ZunResult th06_real_anm_draw(AnmManager *manager, const AnmVm *vm)
+    asm("__real__ZN10AnmManager4DrawEPK5AnmVm");
+extern "C" ZunResult th06_wrap_anm_draw(AnmManager *manager, const AnmVm *vm)
+    asm("__wrap__ZN10AnmManager4DrawEPK5AnmVm");
+
+extern "C" ZunResult th06_wrap_anm_draw(AnmManager *manager, const AnmVm *vm)
+{
+    if (__atomic_load_n(&gBulletRenderMath, __ATOMIC_RELAXED) != 0)
+    {
+        if (FastBulletOrthographicDraw(manager, vm))
+        {
+            __atomic_add_fetch(&gBulletFastDraws, 1u, __ATOMIC_RELAXED);
+            return ZUN_SUCCESS;
+        }
+        __atomic_add_fetch(&gBulletFallbackDraws, 1u, __ATOMIC_RELAXED);
+    }
+    return th06_real_anm_draw(manager, vm);
+}
+
+extern "C" ZunResult th06_real_anm_draw2(AnmManager *manager, const AnmVm *vm)
+    asm("__real__ZN10AnmManager5Draw2EPK5AnmVm");
+extern "C" ZunResult th06_wrap_anm_draw2(AnmManager *manager, const AnmVm *vm)
+    asm("__wrap__ZN10AnmManager5Draw2EPK5AnmVm");
+
+extern "C" ZunResult th06_wrap_anm_draw2(AnmManager *manager, const AnmVm *vm)
+{
+    if (__atomic_load_n(&gBulletRenderMath, __ATOMIC_RELAXED) != 0)
+    {
+        if (FastBulletPerspectiveDraw(manager, vm))
+        {
+            __atomic_add_fetch(&gBulletFastDraws, 1u, __ATOMIC_RELAXED);
+            return ZUN_SUCCESS;
+        }
+        __atomic_add_fetch(&gBulletFallbackDraws, 1u, __ATOMIC_RELAXED);
+    }
+    return th06_real_anm_draw2(manager, vm);
+}
+
+extern "C" void th06_psp_bullet_fast_stats(unsigned int *fastDraws, unsigned int *fallbackDraws)
+{
+    if (fastDraws)
+        *fastDraws = __atomic_load_n(&gBulletFastDraws, __ATOMIC_RELAXED);
+    if (fallbackDraws)
+        *fallbackDraws = __atomic_load_n(&gBulletFallbackDraws, __ATOMIC_RELAXED);
 }
 
 // A handful of the inherited engine's diagnostic calls sit outside their
@@ -323,6 +612,16 @@ extern "C" void th06_psp_cpu_perf_window(unsigned long long *calcUs, unsigned lo
     gPerfDrawCalls = 0;
 }
 
+extern "C" void th06_psp_cpu_perf_flight_window(unsigned long long *calcUs, unsigned long long *drawUs)
+{
+    if (calcUs)
+        *calcUs = gPerfFlightCalcUs;
+    if (drawUs)
+        *drawUs = gPerfFlightDrawUs;
+    gPerfFlightCalcUs = 0;
+    gPerfFlightDrawUs = 0;
+}
+
 extern "C" int th06_real_run_calc_chain(Chain *chain) asm("__real__ZN5Chain12RunCalcChainEv");
 extern "C" int th06_wrap_run_calc_chain(Chain *chain) asm("__wrap__ZN5Chain12RunCalcChainEv");
 
@@ -345,7 +644,9 @@ extern "C" int th06_wrap_run_calc_chain(Chain *chain)
         th06_psp_boot_notef("BOSS DEATH CALC END R%d", result);
         __atomic_sub_fetch(&gBossDeathTraceFrames, 1, __ATOMIC_ACQ_REL);
     }
-    gPerfCalcUs += sceKernelGetSystemTimeWide() - perfStartUs;
+    const unsigned long long elapsedUs = sceKernelGetSystemTimeWide() - perfStartUs;
+    gPerfCalcUs += elapsedUs;
+    gPerfFlightCalcUs += elapsedUs;
     ++gPerfCalcCalls;
     return result;
 }
@@ -370,7 +671,9 @@ extern "C" int th06_wrap_run_draw_chain(Chain *chain)
         th06_psp_boot_notef("CHAIN DRAW END R%d", result);
         __atomic_sub_fetch(&gTransitionTraceBudget, 1, __ATOMIC_ACQ_REL);
     }
-    gPerfDrawUs += sceKernelGetSystemTimeWide() - perfStartUs;
+    const unsigned long long elapsedUs = sceKernelGetSystemTimeWide() - perfStartUs;
+    gPerfDrawUs += elapsedUs;
+    gPerfFlightDrawUs += elapsedUs;
     ++gPerfDrawCalls;
     return result;
 }
@@ -1579,10 +1882,105 @@ extern "C" int th06_real_add_draw_chain(Chain *chain, ChainElem *elem, int prior
 extern "C" int th06_wrap_add_draw_chain(Chain *chain, ChainElem *elem, int priority)
     asm("__wrap__ZN5Chain14AddToDrawChainEP9ChainElemi");
 
+extern "C" ChainCallbackResult th06_real_bullet_draw(BulletManager *manager)
+    asm("__real__ZN13BulletManager6OnDrawEPS_");
+extern "C" ChainCallbackResult th06_wrap_bullet_draw(BulletManager *manager)
+    asm("__wrap__ZN13BulletManager6OnDrawEPS_");
+
+extern "C" ChainCallbackResult th06_wrap_bullet_draw(BulletManager *manager)
+{
+    __atomic_store_n(&gBulletRenderMath, 1u, __ATOMIC_RELEASE);
+    if (manager == nullptr)
+    {
+        __atomic_store_n(&gBulletRenderMath, 0u, __ATOMIC_RELEASE);
+        return th06_real_bullet_draw(manager);
+    }
+
+    g_AnmManager->SetDepthFunc(DEPTH_FUNC_ALWAYS);
+
+    // Preserve the laser path exactly, but use the VFPU's paired operation
+    // instead of two scalar libm calls while the angle is in the proven game
+    // range.  Lasers are few; all bulk work below is the bullet path.
+    for (Laser &laser : manager->lasers)
+    {
+        if (!laser.inUse)
+            continue;
+        float sine;
+        float cosine;
+        if (std::isfinite(laser.angle) && laser.angle >= -16.0f * ZUN_PI && laser.angle <= 16.0f * ZUN_PI)
+            vfpu_sincos(laser.angle, &sine, &cosine);
+        else
+            fsincos_wrapper(&sine, &cosine, laser.angle);
+        const float laserOffset = (laser.endOffset - laser.startOffset) * 0.5f + laser.startOffset;
+        laser.vm0.pos.x = cosine * laserOffset + laser.pos.x;
+        laser.vm0.pos.y = sine * laserOffset + laser.pos.y;
+        laser.vm0.pos.z = 0.0f;
+        laser.color = COLOR_COMBINE_ALPHA(COLOR_WHITE, laser.color);
+        g_AnmManager->Draw3(&laser.vm0);
+
+        if (laser.startOffset < 16.0f || laser.speed == 0.0f)
+        {
+            laser.vm1.pos.x = cosine * laser.startOffset + laser.pos.x;
+            laser.vm1.pos.y = sine * laser.startOffset + laser.pos.y;
+            laser.vm1.pos.z = 0.0f;
+            laser.vm1.color = laser.vm0.color;
+            laser.vm1.flags.colorOp = AnmVmColorOp_Add;
+            laser.vm1.color = COLOR_SET_ALPHA2(laser.vm1.color, 0xff);
+            laser.vm1.scaleX = (laser.width / 10.0f) * ((16.0f - laser.startOffset) / 16.0f);
+            laser.vm1.scaleY = laser.vm1.scaleX;
+            if (laser.vm1.scaleY < 0.0f)
+                laser.vm1.scaleX = laser.vm1.scaleY = laser.width / 10.0f;
+            g_AnmManager->Draw3(&laser.vm1);
+        }
+    }
+
+    g_ItemManager.OnDraw();
+
+    // The inherited renderer walks all 640 slots four times to establish its
+    // four visual layers.  Classify once, retain the original order inside
+    // each layer (important for alpha blending), then draw each bucket.
+    unsigned int bucketCounts[4] = {};
+    for (Bullet &bullet : manager->bullets)
+    {
+        if (bullet.state == 0)
+            continue;
+        int bucket = -1;
+        if (bullet.sprites.bulletHeight > 16)
+            bucket = 0;
+        else if (bullet.sprites.bulletHeight == 16)
+            bucket = (bullet.sprites.spriteBullet.anmFileIndex == ANM_SCRIPT_BULLET3_RING_BALL ||
+                      bullet.sprites.spriteBullet.anmFileIndex == ANM_SCRIPT_BULLET3_BALL)
+                         ? 1
+                         : 2;
+        else if (bullet.sprites.bulletHeight == 8)
+            bucket = 3;
+        if (bucket >= 0)
+            gPspBulletDrawBuckets[bucket][bucketCounts[bucket]++] = &bullet;
+    }
+
+    for (int bucket = 0; bucket < 4; ++bucket)
+    {
+        for (unsigned int i = 0; i < bucketCounts[bucket]; ++i)
+        {
+            Bullet *bullet = gPspBulletDrawBuckets[bucket][i];
+            if (g_Supervisor.hasD3dHardwareVertexProcessing)
+                BulletManager::DrawBullet(bullet);
+            else
+                BulletManager::DrawBulletNoHwVertex(bullet);
+        }
+    }
+
+    g_AnmManager->SetDepthFunc(DEPTH_FUNC_LEQUAL);
+    __atomic_store_n(&gBulletRenderMath, 0u, __ATOMIC_RELEASE);
+    return CHAIN_CALLBACK_RESULT_CONTINUE;
+}
+
 extern "C" int th06_wrap_add_draw_chain(Chain *chain, ChainElem *elem, int priority)
 {
     if (elem != nullptr && elem->callback == reinterpret_cast<ChainCallback>(th06_real_effects_draw))
         elem->callback = reinterpret_cast<ChainCallback>(th06_wrap_effects_draw);
+    else if (elem != nullptr && elem->callback == reinterpret_cast<ChainCallback>(th06_real_bullet_draw))
+        elem->callback = reinterpret_cast<ChainCallback>(th06_wrap_bullet_draw);
     const bool trace = __atomic_load_n(&gTransitionTraceBudget, __ATOMIC_ACQUIRE) != 0;
     if (trace)
         th06_psp_boot_notef("ADD DRAW BEGIN P%d", priority);

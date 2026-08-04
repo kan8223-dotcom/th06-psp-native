@@ -35,6 +35,25 @@ void th06_psp_me_audio_shutdown(void);
 void th06_psp_me_audio_diag_window(unsigned int *jobs, unsigned int *fallbacks,
                                     unsigned int *timeouts, unsigned int *maxWaitUs);
 
+// Pack one engine vertex stream into the native interleaved GE layout on ME.
+// A successful output remains valid until th06_psp_me_vertex_frame_begin(),
+// which the renderer calls only after the previous GE list has completed.
+typedef struct Th06PspMeVertexPack
+{
+    const void *position;
+    const void *texcoord;
+    const void *diffuse;
+    unsigned int positionStride;
+    unsigned int texcoordStride;
+    unsigned int diffuseStride;
+    unsigned int count;
+    unsigned int textured;
+    unsigned int colored;
+} Th06PspMeVertexPack;
+
+void th06_psp_me_vertex_frame_begin(void);
+int th06_psp_me_vertex_pack(const Th06PspMeVertexPack *job, const void **output);
+
 #ifdef __cplusplus
 }
 #endif

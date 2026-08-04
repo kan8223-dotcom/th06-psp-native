@@ -4,9 +4,12 @@
 #include <pspge.h>
 #include <pspgu.h>
 #include <pspgum.h>
+#include <pspiofilemgr.h>
 #include <pspkernel.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <malloc.h>
@@ -14,7 +17,9 @@
 
 #include "AnmManager.hpp"
 #include "Supervisor.hpp"
+#include "audio_me.h"
 #include "diag.hpp"
+#include "fileio.hpp"
 #include "memory.hpp"
 #include "video.hpp"
 
@@ -32,15 +37,30 @@ constexpr unsigned int kDepthBytes = kBufferWidth * kScreenHeight * 2;
 constexpr unsigned int kEdramUsedBytes = kDepthOffset + kDepthBytes;
 constexpr int kMaxTextures = 512;
 constexpr int kSurfaceCacheEntries = 2;
-constexpr unsigned int kCommandBytes = 256 * 1024;
-constexpr unsigned int kVertexBytes = 512 * 1024;
-constexpr unsigned int kListSoftLimit = kCommandBytes - 16 * 1024;
+constexpr unsigned int kMaxVertexPayloadBytes = 512 * 1024;
+constexpr unsigned int kListBytes = (256 + 512) * 1024;
+constexpr unsigned int kListSoftLimit = kListBytes - 16 * 1024;
+constexpr unsigned int kPerDrawCommandReserve = 1024;
+// Reuse the never-approached tail of AnmManager's 0x18000-vertex (2.25 MiB)
+// engine buffer as a per-frame native GE arena.  This adds no PSP-1000 RAM.
+// Real play peaks around 6k source vertices; the reserved tail starts after
+// vertex 81920 and holds 16k native textured/coloured vertices.
+constexpr unsigned int kDeferredVertexArenaBytes = 384 * 1024;
+// Mailbox/cache setup is not worthwhile for tiny UI quads.  Large sprite
+// batches dominate the measured bullet path and amortise one ME round trip.
+// Real hardware rejected the ME-packed vertex stream twice with the same
+// geometry corruption.  Compile its callsite out entirely; ME remains
+// available to the independent PCM mixer only.
+constexpr bool kMeVertexPackingEnabled = false;
+constexpr int kMeVertexPackMinCount = 96;
 
-// Command data and transient vertices have separate arenas.  Putting vertex
-// payloads in sceGuGetMemory would make a busy TH06 frame compete with its GE
-// commands for the same fixed list and turn overflow into memory corruption.
-alignas(16) unsigned int gCommandList[kCommandBytes / sizeof(unsigned int)];
-alignas(16) unsigned char gVertexArena[kVertexBytes];
+// sceGuStart() converts this list to the PSP's 0x40000000 uncached alias.
+// Allocations returned by sceGuGetMemory() therefore become GE-visible before
+// the following draw command without a per-draw dcache syscall.  The old
+// command and vertex arenas totalled the same 768 KiB; combining them does not
+// increase the PSP-1000 RAM budget.  The explicit soft-limit check in Draw()
+// keeps commands, sceGuGetMemory's jump words and vertex payloads in bounds.
+alignas(16) unsigned int gCommandList[kListBytes / sizeof(unsigned int)];
 
 struct GuVertexPosition
 {
@@ -59,6 +79,8 @@ struct GuVertexTexPosition
     float z;
 };
 static_assert(sizeof(GuVertexTexPosition) == 20, "unexpected GE textured vertex layout");
+static_assert(sizeof(VertexTex1Xyzrhw) == 24, "unexpected TH06 sprite vertex layout");
+static_assert(offsetof(VertexTex1Xyzrhw, textureUV) == 16, "unexpected TH06 sprite UV offset");
 
 struct GuVertexColorPosition
 {
@@ -130,6 +152,34 @@ extern "C" void th06_psp_mark_surface_ge_cached(unsigned int serial, int cached)
 class PspGuGfx;
 PspGuGfx *gPspGuBackend;
 
+struct GePerfFlightRecord
+{
+    unsigned int valid;
+    unsigned int slow;
+    unsigned int busy10;
+    unsigned int fps10;
+    unsigned int cpu10;
+    unsigned int ge10;
+    unsigned int vblank10;
+    unsigned int calc10;
+    unsigned int draw10;
+    unsigned int rest10;
+    unsigned int draws;
+    unsigned int vertices;
+    unsigned int listKb;
+    unsigned int lists10;
+};
+
+GePerfFlightRecord gGePerfFlight{};
+volatile unsigned int gGePerfFlightSequence;
+
+void PublishGePerfFlight(const GePerfFlightRecord &candidate)
+{
+    __atomic_add_fetch(&gGePerfFlightSequence, 1u, __ATOMIC_ACQ_REL);
+    gGePerfFlight = candidate;
+    __atomic_add_fetch(&gGePerfFlightSequence, 1u, __ATOMIC_RELEASE);
+}
+
 unsigned int NextPowerOfTwo(unsigned int value)
 {
     unsigned int result = 1;
@@ -185,18 +235,24 @@ class PspGuGfx final : public GfxInterface
 {
   public:
     PspGuGfx()
-        : mBoundTexture(0), mVertexOffset(0), mCurrentDrawBuffer(0), mListOpen(false), mError(false),
-          mUseTexCoord(false), mUseDiffuse(false), mTextureEnableKnown(false), mTextureEnabled(false),
+        : mBoundTexture(0), mCurrentDrawBuffer(0), mListOpen(false), mError(false),
+          mUseTexCoord(false), mUseDiffuse(false), mSpriteCollapseEnabled(false),
+          mTextureEnableKnown(false), mTextureEnabled(false),
           mAppliedTexture(~0u), mColorOpKnown(false), mAppliedColorOp(COLOR_OP_MODULATE),
           mPrimitiveColorKnown(false), mAppliedPrimitiveColor(0),
-          mBlendMode(BLEND_INV_SRC_ALPHA),
+          mBlendMode(BLEND_INV_SRC_ALPHA), mMatricesDirty(true),
           mDepthFunc(DEPTH_FUNC_LEQUAL), mDepthWrite(true), mDepthTest(false), mTextureFactor(0xffffffffu),
           mColorOp(COLOR_OP_MODULATE), mClearDepth(1.0f), mClearColor(0xff000000u), mFogNear(1000.0f),
           mFogFar(5000.0f), mFogColor(0xffa0a0a0u), mFrames(0), mFirstFrameUs(0), mDraws(0), mVertices(0),
           mTextureBytes(0), mEdramSize(0), mMaxListBytes(0), mListsThisFrame(0), mSurfaceCacheClock(0), mTracedCreate(false),
           mTracedDummyImage(false), mTracedViewport(false), mTracedClear(false), mRuntimeTextureTraces(0),
           mRuntimeUploadTraces(0), mFrameStartUs(0), mPerfWindowStartUs(0), mPerfCpuUs(0), mPerfGeUs(0),
-          mPerfVblankUs(0), mPerfStartDraws(0), mPerfStartVertices(0), mPerfFrames(0)
+          mPerfVblankUs(0), mPerfStartDraws(0), mPerfStartVertices(0), mPerfFrames(0),
+          mFlightWindowStartUs(0), mFlightCpuUs(0), mFlightGeUs(0), mFlightVblankUs(0),
+          mFlightStartDraws(0), mFlightStartVertices(0), mFlightLists(0), mFlightFrames(0),
+          mDeferredVertices(nullptr), mDeferredCount(0), mDeferredArenaUsed(0),
+          mDeferredTexture(0), mDeferredColorOp(COLOR_OP_MODULATE),
+          mDeferredSourceDraws(0)
     {
         std::memset(mTextures, 0, sizeof(mTextures));
         std::memset(mFreeTextureBlocks, 0, sizeof(mFreeTextureBlocks));
@@ -204,6 +260,7 @@ class PspGuGfx final : public GfxInterface
         std::memset(mAttributePointers, 0, sizeof(mAttributePointers));
         std::memset(mAttributeStrides, 0, sizeof(mAttributeStrides));
         std::memset(mTracedTransform, 0, sizeof(mTracedTransform));
+        std::memset(mMatrixKnown, 0, sizeof(mMatrixKnown));
         // GetViewport() must report the same physical 4:3 viewport that
         // ZunViewport::Set() produces.  Returning the whole 480-wide panel
         // made the engine reverse (0 - VIEWPORT_OFF_X) through a u32.  On the
@@ -225,6 +282,7 @@ class PspGuGfx final : public GfxInterface
             gPspGuBackend = nullptr;
         if (mListOpen)
         {
+            FlushDeferredDraw();
             sceGuFinish();
             sceGuSync(0, 0);
             mListOpen = false;
@@ -260,6 +318,14 @@ class PspGuGfx final : public GfxInterface
         th06_psp_boot_note("GE TEXTURE SWIZZLE ON");
         th06_psp_boot_note(g_Supervisor.cfg.windowed ? "DISPLAY WINDOWED 4:3 362x272"
                                                      : "DISPLAY FULL STRETCH 480x272");
+        char spriteMarker[256];
+        SceIoStat spriteMarkerStat{};
+        const char *gameDir = th06_psp_game_dir();
+        if (gameDir && std::snprintf(spriteMarker, sizeof(spriteMarker),
+                                     "%s/TH06PSP_GE_SPRITES.OFF", gameDir) > 0 &&
+            sceIoGetstat(spriteMarker, &spriteMarkerStat) >= 0)
+            mSpriteCollapseEnabled = false;
+        th06_psp_boot_note(mSpriteCollapseEnabled ? "GE SPRITE2 ON" : "GE SPRITE2 OFF (NO GAIN)");
         if (kEdramUsedBytes > mEdramSize)
         {
             th06_psp_boot_note("EDRAM LAYOUT OOM");
@@ -293,6 +359,7 @@ class PspGuGfx final : public GfxInterface
         ApplyBlendMode();
         sceGuDisable(GU_DEPTH_TEST);
         sceGuDepthMask(GU_FALSE);
+        sceGuDepthFunc(GU_GEQUAL);
         sceGuTexWrap(GU_REPEAT, GU_REPEAT);
         sceGuTexFilter(GU_LINEAR, GU_LINEAR);
         sceGuTexMapMode(GU_TEXTURE_COORDS, 0, 0);
@@ -333,6 +400,9 @@ class PspGuGfx final : public GfxInterface
 
     void SetFogRange(f32 nearPlane, f32 farPlane) override
     {
+        if (mFogNear == nearPlane && mFogFar == farPlane)
+            return;
+        FlushDeferredDraw();
         mFogNear = nearPlane;
         mFogFar = farPlane;
         ApplyFog();
@@ -340,6 +410,9 @@ class PspGuGfx final : public GfxInterface
 
     void SetFogColor(ZunColor color) override
     {
+        if (mFogColor == color)
+            return;
+        FlushDeferredDraw();
         mFogColor = color;
         ApplyFog();
     }
@@ -382,12 +455,19 @@ class PspGuGfx final : public GfxInterface
         }
         static const int modes[] = {GU_MODEL, GU_VIEW, GU_PROJECTION, GU_TEXTURE};
         const ScePspFMatrix4 converted = ToGuMatrix(matrix);
+        if (mMatrixKnown[type] && std::memcmp(&mAppliedMatrices[type], &converted, sizeof(converted)) == 0)
+            return;
+        FlushDeferredDraw();
+        mAppliedMatrices[type] = converted;
+        mMatrixKnown[type] = true;
         sceGumMatrixMode(modes[type]);
         sceGumLoadMatrix(&converted);
+        mMatricesDirty = true;
     }
 
     void SetTextureFilter() override
     {
+        FlushDeferredDraw();
         sceGuTexFilter(GU_LINEAR, GU_LINEAR);
     }
 
@@ -411,6 +491,9 @@ class PspGuGfx final : public GfxInterface
                                 static_cast<long>(width), static_cast<long>(height));
             mTracedViewport = true;
         }
+        if (mViewport[0] == x && mViewport[1] == y && mViewport[2] == width && mViewport[3] == height)
+            return;
+        FlushDeferredDraw();
         mViewport[0] = x;
         mViewport[1] = y;
         mViewport[2] = width;
@@ -420,6 +503,9 @@ class PspGuGfx final : public GfxInterface
 
     void SetDepthRange(f32 nearPlane, f32 farPlane) override
     {
+        if (mDepthRange[0] == nearPlane && mDepthRange[1] == farPlane)
+            return;
+        FlushDeferredDraw();
         mDepthRange[0] = nearPlane;
         mDepthRange[1] = farPlane;
         ApplyDepthRange();
@@ -427,6 +513,7 @@ class PspGuGfx final : public GfxInterface
 
     void Enable(Capabilities cap) override
     {
+        FlushDeferredDraw();
         if (cap == CAPS_BLEND)
             sceGuEnable(GU_BLEND);
         else if (cap == CAPS_DEPTH_TEST)
@@ -445,12 +532,18 @@ class PspGuGfx final : public GfxInterface
 
     void SetBlendMode(BlendMode mode) override
     {
+        if (mBlendMode == mode)
+            return;
+        FlushDeferredDraw();
         mBlendMode = mode;
         ApplyBlendMode();
     }
 
     void SetDepthMask(bool enable) override
     {
+        if (mDepthWrite == enable)
+            return;
+        FlushDeferredDraw();
         mDepthWrite = enable;
         // GU_TRUE means masked (writes disabled), opposite to GfxInterface.
         sceGuDepthMask(enable ? GU_FALSE : GU_TRUE);
@@ -458,6 +551,9 @@ class PspGuGfx final : public GfxInterface
 
     void SetDepthFunc(DepthFunc func) override
     {
+        if (mDepthFunc == func)
+            return;
+        FlushDeferredDraw();
         mDepthFunc = func;
         // The PSP depth buffer is reversed (near=65535, far=0).
         sceGuDepthFunc(func == DEPTH_FUNC_LEQUAL ? GU_GEQUAL : GU_ALWAYS);
@@ -465,18 +561,21 @@ class PspGuGfx final : public GfxInterface
 
     void SetClearDepth(f32 depth) override
     {
+        FlushDeferredDraw();
         mClearDepth = depth;
         sceGuClearDepth(ToHardwareDepth(depth));
     }
 
     void SetClearColor(f32 r, f32 g, f32 b, f32 a) override
     {
+        FlushDeferredDraw();
         mClearColor = FloatColor(r, g, b, a);
         sceGuClearColor(mClearColor);
     }
 
     void Clear(u32 clearBits) override
     {
+        FlushDeferredDraw();
         if (th06_psp_transition_trace_take(1u << 1))
             th06_psp_boot_notef("TRACE GE CLEAR %lu", static_cast<unsigned long>(clearBits));
         if (mFrames == 0 && !mTracedClear)
@@ -533,6 +632,7 @@ class PspGuGfx final : public GfxInterface
     {
         if (handle.id == 0 || handle.id >= kMaxTextures || !mTextures[handle.id].used)
             return;
+        FlushDeferredDraw();
         // A queued GE draw may still refer to this RAM. Complete it before
         // returning the allocation to newlib or reusing the handle.
         if (mTextures[handle.id].pixels && !mTextures[handle.id].borrowedSurfaceCache)
@@ -548,6 +648,7 @@ class PspGuGfx final : public GfxInterface
 
     void SetTextureImage(u32 width, u32 height, PixelFormat fmt, PixelDataType type, const void *data) override
     {
+        FlushDeferredDraw();
         const bool traceDummy = mFrames == 0 && !mTracedDummyImage && width == 1 && height == 1;
         if (traceDummy)
         {
@@ -709,6 +810,7 @@ class PspGuGfx final : public GfxInterface
 
     void SetTextureSubImage(i32 xoffset, i32 yoffset, i32 width, i32 height, const void *data) override
     {
+        FlushDeferredDraw();
         if (mBoundTexture == 0 || !data)
             return;
         GuTexture &texture = mTextures[mBoundTexture];
@@ -868,23 +970,137 @@ class PspGuGfx final : public GfxInterface
         // smallest native layout before reserving the live vertex arena.
         const bool textured = mUseTexCoord && mAttributePointers[VERTEX_ARRAY_TEX_COORD];
         const bool colored = mUseDiffuse && mAttributePointers[VERTEX_ARRAY_DIFFUSE];
+
+        // AnmManager's buffered path emits every axis-aligned sprite as six
+        // triangle vertices in VertexTex1Xyzrhw layout.  GE's native sprite
+        // primitive represents the same rectangle with only its two opposite
+        // corners.  Collapse only the exact, uncoloured engine layout and
+        // require every quad in the batch to be axis-aligned and unflipped;
+        // rotated/mirrored/general triangles retain the proven path below.
+        bool collapseSpriteBatch =
+            mSpriteCollapseEnabled && type == PRIM_TRIANGLES && count >= 6 && count % 6 == 0 &&
+            textured && !colored &&
+            mAttributeStrides[VERTEX_ARRAY_POSITION] == sizeof(VertexTex1Xyzrhw) &&
+            mAttributeStrides[VERTEX_ARRAY_TEX_COORD] == sizeof(VertexTex1Xyzrhw) &&
+            mAttributePointers[VERTEX_ARRAY_TEX_COORD] ==
+                mAttributePointers[VERTEX_ARRAY_POSITION] + offsetof(VertexTex1Xyzrhw, textureUV);
+        const VertexTex1Xyzrhw *spriteSource = nullptr;
+        if (collapseSpriteBatch)
+        {
+            spriteSource = reinterpret_cast<const VertexTex1Xyzrhw *>(
+                mAttributePointers[VERTEX_ARRAY_POSITION] +
+                mAttributeStrides[VERTEX_ARRAY_POSITION] * start);
+            const int spriteCount = count / 6;
+            for (int sprite = 0; sprite < spriteCount; ++sprite)
+            {
+                const VertexTex1Xyzrhw *quad = spriteSource + sprite * 6;
+                const ZunVec4 &topLeft = quad[0].position;
+                const ZunVec4 &topRight = quad[1].position;
+                const ZunVec4 &bottomLeft = quad[2].position;
+                const ZunVec4 &bottomRight = quad[5].position;
+                const ZunVec2 &uvTopLeft = quad[0].textureUV;
+                const ZunVec2 &uvTopRight = quad[1].textureUV;
+                const ZunVec2 &uvBottomLeft = quad[2].textureUV;
+                const ZunVec2 &uvBottomRight = quad[5].textureUV;
+                if (topLeft.x != bottomLeft.x || topRight.x != bottomRight.x ||
+                    topLeft.y != topRight.y || bottomLeft.y != bottomRight.y ||
+                    topLeft.z != topRight.z || topLeft.z != bottomLeft.z ||
+                    topLeft.z != bottomRight.z || topLeft.x > bottomRight.x ||
+                    topLeft.y > bottomRight.y || uvTopLeft.x != uvBottomLeft.x ||
+                    uvTopRight.x != uvBottomRight.x || uvTopLeft.y != uvTopRight.y ||
+                    uvBottomLeft.y != uvBottomRight.y)
+                {
+                    collapseSpriteBatch = false;
+                    spriteSource = nullptr;
+                    break;
+                }
+            }
+        }
+
+        const bool nativeSpriteInput =
+            type == PRIM_TRIANGLES && textured && !colored &&
+            mAttributeStrides[VERTEX_ARRAY_POSITION] == sizeof(VertexTex1Xyzrhw) &&
+            mAttributeStrides[VERTEX_ARRAY_TEX_COORD] == sizeof(VertexTex1Xyzrhw) &&
+            mAttributePointers[VERTEX_ARRAY_TEX_COORD] ==
+                mAttributePointers[VERTEX_ARRAY_POSITION] + offsetof(VertexTex1Xyzrhw, textureUV);
+        const unsigned int constantColor = ToGuColor(mTextureFactor);
+        if (!collapseSpriteBatch && nativeSpriteInput && QueueDeferredTriangles(start, count, constantColor))
+            return;
+
+        // A general draw or an arena boundary must follow all queued sprite
+        // triangles, never overtake them in the GE command stream.
+        FlushDeferredDraw();
+
+        const int submittedCount = collapseSpriteBatch ? count / 3 : count;
         const unsigned int vertexBytes = textured
                                              ? (colored ? sizeof(GuVertexTexColorPosition)
                                                         : sizeof(GuVertexTexPosition))
                                              : (colored ? sizeof(GuVertexColorPosition)
                                                         : sizeof(GuVertexPosition));
-        const unsigned int required = static_cast<unsigned int>(count) * vertexBytes;
-        if (required > kVertexBytes)
+        const unsigned int required = static_cast<unsigned int>(submittedCount) * vertexBytes;
+        if (required > kMaxVertexPayloadBytes)
         {
             mError = true;
             th06_psp_boot_notef("GE VTX OVERSIZE %u", required);
             return;
         }
-        if (mVertexOffset + required > kVertexBytes || static_cast<unsigned int>(sceGuCheckList()) > kListSoftLimit)
-            SubmitAndRestart();
+        void *vertices = nullptr;
+        bool packedByMe = false;
+        if (!collapseSpriteBatch && kMeVertexPackingEnabled && count >= kMeVertexPackMinCount)
+        {
+            Th06PspMeVertexPack pack{};
+            pack.position = mAttributePointers[VERTEX_ARRAY_POSITION] +
+                            mAttributeStrides[VERTEX_ARRAY_POSITION] * start;
+            pack.positionStride = static_cast<unsigned int>(mAttributeStrides[VERTEX_ARRAY_POSITION]);
+            pack.count = static_cast<unsigned int>(count);
+            pack.textured = textured ? 1u : 0u;
+            pack.colored = colored ? 1u : 0u;
+            if (textured)
+            {
+                pack.texcoord = mAttributePointers[VERTEX_ARRAY_TEX_COORD] +
+                                mAttributeStrides[VERTEX_ARRAY_TEX_COORD] * start;
+                pack.texcoordStride = static_cast<unsigned int>(mAttributeStrides[VERTEX_ARRAY_TEX_COORD]);
+            }
+            if (colored)
+            {
+                pack.diffuse = mAttributePointers[VERTEX_ARRAY_DIFFUSE] +
+                               mAttributeStrides[VERTEX_ARRAY_DIFFUSE] * start;
+                pack.diffuseStride = static_cast<unsigned int>(mAttributeStrides[VERTEX_ARRAY_DIFFUSE]);
+            }
+            const void *meVertices = nullptr;
+            if (th06_psp_me_vertex_pack(&pack, &meVertices))
+            {
+                vertices = const_cast<void *>(meVertices);
+                packedByMe = true;
+            }
+        }
 
-        void *vertices = gVertexArena + mVertexOffset;
-        const unsigned int constantColor = ToGuColor(mTextureFactor);
+        if (packedByMe)
+        {
+            // ME-packed streams live outside the GU list and need command
+            // space only.  This branch is compiled out while vertex ME is
+            // disabled after its real-hardware corruption result.
+            const unsigned int listUsed = static_cast<unsigned int>(std::max(sceGuCheckList(), 0));
+            if (listUsed + kPerDrawCommandReserve > kListSoftLimit)
+                SubmitAndRestart();
+        }
+        else
+        {
+            // sceGuGetMemory aligns to four bytes and inserts an eight-byte
+            // jump over the payload.  Keep the original live-list path as the
+            // bit-identical fallback for PPSSPP, disabled ME and timeouts.
+            const unsigned int listAllocation = ((required + 3u) & ~3u) + 8u;
+            const unsigned int listUsed = static_cast<unsigned int>(std::max(sceGuCheckList(), 0));
+            if (listUsed + listAllocation + kPerDrawCommandReserve > kListSoftLimit)
+                SubmitAndRestart();
+            vertices = sceGuGetMemory(static_cast<int>(required));
+        }
+        if (!vertices)
+        {
+            mError = true;
+            th06_psp_boot_notef("GE VTX LIST OOM %u", required);
+            return;
+        }
         int vertexType = GU_VERTEX_32BITF | GU_TRANSFORM_3D;
         if (!colored && (!mPrimitiveColorKnown || mAppliedPrimitiveColor != constantColor))
         {
@@ -893,7 +1109,33 @@ class PspGuGfx final : public GfxInterface
             mAppliedPrimitiveColor = constantColor;
         }
 
-        if (textured && colored)
+        if (packedByMe)
+        {
+            // ME already produced the exact native interleaved layout.
+        }
+        else if (collapseSpriteBatch)
+        {
+            auto *out = static_cast<GuVertexTexPosition *>(vertices);
+            const int spriteCount = count / 6;
+            for (int sprite = 0; sprite < spriteCount; ++sprite)
+            {
+                const VertexTex1Xyzrhw *quad = spriteSource + sprite * 6;
+                const VertexTex1Xyzrhw &topLeft = quad[0];
+                const VertexTex1Xyzrhw &bottomRight = quad[5];
+                out[sprite * 2].u = topLeft.textureUV.x;
+                out[sprite * 2].v = topLeft.textureUV.y;
+                out[sprite * 2].x = topLeft.position.x;
+                out[sprite * 2].y = topLeft.position.y;
+                out[sprite * 2].z = topLeft.position.z;
+                out[sprite * 2 + 1].u = bottomRight.textureUV.x;
+                out[sprite * 2 + 1].v = bottomRight.textureUV.y;
+                out[sprite * 2 + 1].x = bottomRight.position.x;
+                out[sprite * 2 + 1].y = bottomRight.position.y;
+                out[sprite * 2 + 1].z = bottomRight.position.z;
+            }
+            vertexType |= GU_TEXTURE_32BITF;
+        }
+        else if (textured && colored)
         {
             auto *out = static_cast<GuVertexTexColorPosition *>(vertices);
             for (int i = 0; i < count; ++i)
@@ -918,19 +1160,45 @@ class PspGuGfx final : public GfxInterface
         else if (textured)
         {
             auto *out = static_cast<GuVertexTexPosition *>(vertices);
-            for (int i = 0; i < count; ++i)
+            const bool nativeSpriteLayout =
+                mAttributeStrides[VERTEX_ARRAY_POSITION] == sizeof(VertexTex1Xyzrhw) &&
+                mAttributeStrides[VERTEX_ARRAY_TEX_COORD] == sizeof(VertexTex1Xyzrhw) &&
+                mAttributePointers[VERTEX_ARRAY_TEX_COORD] ==
+                    mAttributePointers[VERTEX_ARRAY_POSITION] + offsetof(VertexTex1Xyzrhw, textureUV);
+            if (nativeSpriteLayout)
             {
-                const int sourceIndex = start + i;
-                const auto *position = reinterpret_cast<const float *>(
-                    mAttributePointers[VERTEX_ARRAY_POSITION] +
-                    mAttributeStrides[VERTEX_ARRAY_POSITION] * sourceIndex);
-                const auto *uv = reinterpret_cast<const float *>(
-                    mAttributePointers[VERTEX_ARRAY_TEX_COORD] + mAttributeStrides[VERTEX_ARRAY_TEX_COORD] * sourceIndex);
-                out[i].u = uv[0];
-                out[i].v = uv[1];
-                out[i].x = position[0];
-                out[i].y = position[1];
-                out[i].z = position[2];
+                // The overwhelmingly common TH06 path is one interleaved
+                // VertexTex1Xyzrhw stream.  Specialise it so GCC can advance
+                // two fixed pointers; the generic path below performed two
+                // runtime-stride multiplies for every one of ~6k vertices.
+                const auto *src = reinterpret_cast<const VertexTex1Xyzrhw *>(
+                    mAttributePointers[VERTEX_ARRAY_POSITION]) + start;
+                for (int i = 0; i < count; ++i, ++src)
+                {
+                    out[i].u = src->textureUV.x;
+                    out[i].v = src->textureUV.y;
+                    out[i].x = src->position.x;
+                    out[i].y = src->position.y;
+                    out[i].z = src->position.z;
+                }
+            }
+            else
+            {
+                for (int i = 0; i < count; ++i)
+                {
+                    const int sourceIndex = start + i;
+                    const auto *position = reinterpret_cast<const float *>(
+                        mAttributePointers[VERTEX_ARRAY_POSITION] +
+                        mAttributeStrides[VERTEX_ARRAY_POSITION] * sourceIndex);
+                    const auto *uv = reinterpret_cast<const float *>(
+                        mAttributePointers[VERTEX_ARRAY_TEX_COORD] +
+                        mAttributeStrides[VERTEX_ARRAY_TEX_COORD] * sourceIndex);
+                    out[i].u = uv[0];
+                    out[i].v = uv[1];
+                    out[i].x = position[0];
+                    out[i].y = position[1];
+                    out[i].z = position[2];
+                }
             }
             vertexType |= GU_TEXTURE_32BITF;
         }
@@ -968,19 +1236,31 @@ class PspGuGfx final : public GfxInterface
         }
 
         ApplyTexture();
-        const int primitive = type == PRIM_TRIANGLE_STRIP ? GU_TRIANGLE_STRIP : GU_TRIANGLES;
-        // GU_DIRECT may consume this command before sceGuFinish().  Publish
-        // the vertices before the draw command enters the live list; delaying
-        // this to frame end produces timing-dependent geometry corruption.
-        sceKernelDcacheWritebackRange(vertices, required);
-        sceGumDrawArray(primitive, vertexType, count, nullptr, vertices);
-        mVertexOffset += (required + 15u) & ~15u;
+        const int primitive = collapseSpriteBatch
+                                  ? GU_SPRITES
+                                  : (type == PRIM_TRIANGLE_STRIP ? GU_TRIANGLE_STRIP : GU_TRIANGLES);
+        // libGUM's draw helper scans all four matrix dirty flags on every
+        // draw.  TH06 emits many batches under one unchanged orthographic
+        // matrix, so update GUM only after an actual matrix change and submit
+        // the remaining draws directly to GU.
+        if (mMatricesDirty)
+        {
+            sceGumUpdateMatrix();
+            mMatricesDirty = false;
+        }
+
+        // GU_DIRECT may consume the draw before sceGuFinish().  Unlike the old
+        // cached arena, sceGuGetMemory returns storage inside libGU's uncached
+        // live list, so the completed vertex writes are already visible when
+        // sceGuDrawArray publishes the draw command.
+        sceGuDrawArray(primitive, vertexType, submittedCount, nullptr, vertices);
         ++mDraws;
-        mVertices += static_cast<unsigned int>(count);
+        mVertices += static_cast<unsigned int>(submittedCount);
     }
 
     void SwapBuffers() override
     {
+        FlushDeferredDraw();
         const unsigned long long cpuEndUs = sceKernelGetSystemTimeWide();
         const bool traceTransitionSwap = th06_psp_transition_trace_take(1u << 3) != 0;
         if (traceTransitionSwap)
@@ -1024,6 +1304,65 @@ class PspGuGfx final : public GfxInterface
         mPerfGeUs += geEndUs - geStartUs;
         mPerfVblankUs += vblankEndUs - geEndUs;
         ++mPerfFrames;
+
+        if (mFlightWindowStartUs == 0)
+        {
+            mFlightWindowStartUs = mFrameStartUs ? mFrameStartUs : cpuEndUs;
+            mFlightStartDraws = mDraws;
+            mFlightStartVertices = mVertices;
+            th06_psp_cpu_perf_flight_window(nullptr, nullptr);
+        }
+        if (mFrameStartUs != 0)
+            mFlightCpuUs += cpuEndUs - mFrameStartUs;
+        mFlightGeUs += geEndUs - geStartUs;
+        mFlightVblankUs += vblankEndUs - geEndUs;
+        mFlightLists += mListsThisFrame;
+        ++mFlightFrames;
+
+        if (mFlightFrames >= 60)
+        {
+            const unsigned long long elapsedUs = vblankEndUs - mFlightWindowStartUs;
+            GePerfFlightRecord candidate{};
+            candidate.valid = 1;
+            candidate.fps10 = elapsedUs
+                                  ? static_cast<unsigned int>(mFlightFrames * 10000000ull / elapsedUs)
+                                  : 0;
+            candidate.cpu10 = static_cast<unsigned int>(mFlightCpuUs / mFlightFrames / 100u);
+            candidate.ge10 = static_cast<unsigned int>(mFlightGeUs / mFlightFrames / 100u);
+            candidate.vblank10 = static_cast<unsigned int>(mFlightVblankUs / mFlightFrames / 100u);
+            candidate.draws = (mDraws - mFlightStartDraws) / mFlightFrames;
+            candidate.vertices = (mVertices - mFlightStartVertices) / mFlightFrames;
+            candidate.listKb = mMaxListBytes / 1024u;
+            candidate.lists10 = mFlightLists * 10u / mFlightFrames;
+            unsigned long long calcTotalUs = 0;
+            unsigned long long drawTotalUs = 0;
+            th06_psp_cpu_perf_flight_window(&calcTotalUs, &drawTotalUs);
+            const unsigned long long chainTotalUs = calcTotalUs + drawTotalUs;
+            const unsigned long long restTotalUs = mFlightCpuUs > chainTotalUs ? mFlightCpuUs - chainTotalUs : 0;
+            candidate.calc10 = static_cast<unsigned int>(calcTotalUs / mFlightFrames / 100u);
+            candidate.draw10 = static_cast<unsigned int>(drawTotalUs / mFlightFrames / 100u);
+            candidate.rest10 = static_cast<unsigned int>(restTotalUs / mFlightFrames / 100u);
+            candidate.busy10 = candidate.cpu10 + candidate.ge10;
+            candidate.slow = candidate.fps10 >= 200u && candidate.fps10 <= 450u;
+
+            // Ignore boot/load windows and tiny title/menu draws.  Prefer a
+            // real 20-45fps rendering window; otherwise retain the heaviest
+            // busy window with at least 1000 vertices/frame.
+            const GePerfFlightRecord current = gGePerfFlight;
+            if (mFrames >= 600u && candidate.vertices >= 1000u &&
+                (!current.valid || (candidate.slow && !current.slow) ||
+                 (candidate.slow == current.slow && candidate.busy10 > current.busy10)))
+                PublishGePerfFlight(candidate);
+
+            mFlightWindowStartUs = vblankEndUs;
+            mFlightCpuUs = 0;
+            mFlightGeUs = 0;
+            mFlightVblankUs = 0;
+            mFlightStartDraws = mDraws;
+            mFlightStartVertices = mVertices;
+            mFlightLists = 0;
+            mFlightFrames = 0;
+        }
 
         if (mPerfFrames >= 300)
         {
@@ -1073,7 +1412,6 @@ class PspGuGfx final : public GfxInterface
         }
         th06_psp_video_note_presented();
 
-        mVertexOffset = 0;
         mListsThisFrame = 0;
         StartList();
         // The engine clears only its 4:3 viewport.  Clear the full LCD first
@@ -1087,12 +1425,12 @@ class PspGuGfx final : public GfxInterface
     unsigned int mBoundTexture;
     const unsigned char *mAttributePointers[3];
     std::size_t mAttributeStrides[3];
-    unsigned int mVertexOffset;
     int mCurrentDrawBuffer;
     bool mListOpen;
     bool mError;
     bool mUseTexCoord;
     bool mUseDiffuse;
+    bool mSpriteCollapseEnabled;
     bool mTextureEnableKnown;
     bool mTextureEnabled;
     unsigned int mAppliedTexture;
@@ -1101,6 +1439,9 @@ class PspGuGfx final : public GfxInterface
     bool mPrimitiveColorKnown;
     unsigned int mAppliedPrimitiveColor;
     BlendMode mBlendMode;
+    ScePspFMatrix4 mAppliedMatrices[4];
+    bool mMatrixKnown[4];
+    bool mMatricesDirty;
     DepthFunc mDepthFunc;
     bool mDepthWrite;
     bool mDepthTest;
@@ -1138,6 +1479,110 @@ class PspGuGfx final : public GfxInterface
     unsigned int mPerfStartDraws;
     unsigned int mPerfStartVertices;
     unsigned int mPerfFrames;
+    unsigned long long mFlightWindowStartUs;
+    unsigned long long mFlightCpuUs;
+    unsigned long long mFlightGeUs;
+    unsigned long long mFlightVblankUs;
+    unsigned int mFlightStartDraws;
+    unsigned int mFlightStartVertices;
+    unsigned int mFlightLists;
+    unsigned int mFlightFrames;
+    GuVertexTexColorPosition *mDeferredVertices;
+    unsigned int mDeferredCount;
+    unsigned int mDeferredArenaUsed;
+    unsigned int mDeferredTexture;
+    ColorOp mDeferredColorOp;
+    unsigned int mDeferredSourceDraws;
+
+    unsigned char *DeferredArenaBase() const
+    {
+        if (!g_AnmManager)
+            return nullptr;
+        auto *end = reinterpret_cast<unsigned char *>(g_AnmManager->vertexBuffer + 0x18000);
+        return end - kDeferredVertexArenaBytes;
+    }
+
+    void FlushDeferredDraw()
+    {
+        if (!mDeferredVertices || mDeferredCount == 0)
+            return;
+
+        const unsigned int bytes = mDeferredCount * sizeof(GuVertexTexColorPosition);
+        sceKernelDcacheWritebackRange(mDeferredVertices, bytes);
+        sceGuDrawArray(GU_TRIANGLES,
+                       GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
+                       static_cast<int>(mDeferredCount), nullptr, mDeferredVertices);
+        ++mDraws;
+        mVertices += mDeferredCount;
+        mDeferredVertices = nullptr;
+        mDeferredCount = 0;
+        mDeferredSourceDraws = 0;
+    }
+
+    bool QueueDeferredTriangles(int start, int count, unsigned int constantColor)
+    {
+        if (count <= 0 || !g_AnmManager)
+            return false;
+        unsigned char *arenaBase = DeferredArenaBase();
+        if (!arenaBase)
+            return false;
+
+        // The engine owns the low end of this same large buffer.  Refuse the
+        // shortcut long before the two regions could meet, even under a future
+        // content mod with far more sprites than retail TH06.
+        const auto *engineWrite = reinterpret_cast<const unsigned char *>(g_AnmManager->vertexBufferEndPtr);
+        if (engineWrite >= arenaBase)
+            return false;
+
+        const unsigned int bytes = static_cast<unsigned int>(count) * sizeof(GuVertexTexColorPosition);
+        const bool sameState = mDeferredVertices && mDeferredTexture == mBoundTexture &&
+                               mDeferredColorOp == mColorOp;
+        if (mDeferredVertices && !sameState)
+            FlushDeferredDraw();
+
+        if (mDeferredArenaUsed + bytes > kDeferredVertexArenaBytes)
+            return false;
+
+        if (!mDeferredVertices)
+        {
+            // The delayed group emits only one primitive command.  Check the
+            // command list once when it starts, rather than once for every
+            // inherited engine flush that is folded into the group.
+            if (static_cast<unsigned int>(std::max(sceGuCheckList(), 0)) + kPerDrawCommandReserve >
+                kListSoftLimit)
+                SubmitAndRestart();
+
+            // Publish all state before delaying only the primitive command.
+            // Any later real state mutation flushes this pending primitive
+            // first, preserving the original command ordering.
+            ApplyTexture();
+            if (mMatricesDirty)
+            {
+                sceGumUpdateMatrix();
+                mMatricesDirty = false;
+            }
+            mDeferredVertices = reinterpret_cast<GuVertexTexColorPosition *>(arenaBase + mDeferredArenaUsed);
+            mDeferredTexture = mBoundTexture;
+            mDeferredColorOp = mColorOp;
+        }
+
+        auto *out = reinterpret_cast<GuVertexTexColorPosition *>(arenaBase + mDeferredArenaUsed);
+        const auto *src = reinterpret_cast<const VertexTex1Xyzrhw *>(
+            mAttributePointers[VERTEX_ARRAY_POSITION]) + start;
+        for (int i = 0; i < count; ++i, ++src)
+        {
+            out[i].u = src->textureUV.x;
+            out[i].v = src->textureUV.y;
+            out[i].color = constantColor;
+            out[i].x = src->position.x;
+            out[i].y = src->position.y;
+            out[i].z = src->position.z;
+        }
+        mDeferredArenaUsed += bytes;
+        mDeferredCount += static_cast<unsigned int>(count);
+        ++mDeferredSourceDraws;
+        return true;
+    }
 
     void RecycleTexturePixels(GuTexture &texture)
     {
@@ -1192,6 +1637,13 @@ class PspGuGfx final : public GfxInterface
 
     void StartList()
     {
+        // StartList follows a completed sceGuSync at every ownership boundary,
+        // so every pointer from the preceding frame/list is no longer in use.
+        th06_psp_me_vertex_frame_begin();
+        mDeferredVertices = nullptr;
+        mDeferredCount = 0;
+        mDeferredArenaUsed = 0;
+        mDeferredSourceDraws = 0;
         sceGuStart(GU_DIRECT, gCommandList);
         mListOpen = true;
         ++mListsThisFrame;
@@ -1417,11 +1869,11 @@ class PspGuGfx final : public GfxInterface
     {
         if (!mListOpen)
             return;
+        FlushDeferredDraw();
         const int listBytes = sceGuFinish();
         mListOpen = false;
         mMaxListBytes = std::max(mMaxListBytes, static_cast<unsigned int>(std::max(listBytes, 0)));
         sceGuSync(0, 0);
-        mVertexOffset = 0;
         StartList();
     }
 
@@ -1641,6 +2093,40 @@ class PspGuGfx final : public GfxInterface
 };
 
 } // namespace
+
+extern "C" void th06_psp_ge_diag_checkpoint(const char *tag)
+{
+    GePerfFlightRecord record{};
+    for (;;)
+    {
+        const unsigned int sequenceBefore = __atomic_load_n(&gGePerfFlightSequence, __ATOMIC_ACQUIRE);
+        if (sequenceBefore & 1u)
+            continue;
+        record = gGePerfFlight;
+        const unsigned int sequenceAfter = __atomic_load_n(&gGePerfFlightSequence, __ATOMIC_ACQUIRE);
+        if (sequenceBefore == sequenceAfter && !(sequenceAfter & 1u))
+            break;
+    }
+
+    if (!record.valid)
+    {
+        th06_psp_boot_notef("GE! %s NO HEAVY WINDOW", tag ? tag : "?");
+        return;
+    }
+
+    th06_psp_boot_notef("GE! %s %u.%uF C%u.%u G%u.%u B%u.%u SC%u.%u/%u.%u/%u.%u D%u V%u L%uK S%u.%u",
+                        tag ? tag : "?", record.fps10 / 10u, record.fps10 % 10u,
+                        record.cpu10 / 10u, record.cpu10 % 10u, record.ge10 / 10u,
+                        record.ge10 % 10u, record.vblank10 / 10u, record.vblank10 % 10u,
+                        record.calc10 / 10u, record.calc10 % 10u, record.draw10 / 10u,
+                        record.draw10 % 10u, record.rest10 / 10u, record.rest10 % 10u,
+                        record.draws, record.vertices, record.listKb, record.lists10 / 10u,
+                        record.lists10 % 10u);
+    unsigned int fastDraws = 0;
+    unsigned int fallbackDraws = 0;
+    th06_psp_bullet_fast_stats(&fastDraws, &fallbackDraws);
+    th06_psp_boot_notef("BULLET FAST %u FALLBACK %u", fastDraws, fallbackDraws);
+}
 
 GfxInterface *Th06CreatePspGuBackend()
 {
