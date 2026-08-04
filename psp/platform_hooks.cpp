@@ -5,6 +5,7 @@
 
 #include <pspkernel.h>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
@@ -47,6 +48,7 @@ unsigned long long gPerfCalcUs;
 unsigned long long gPerfDrawUs;
 unsigned int gPerfCalcCalls;
 unsigned int gPerfDrawCalls;
+unsigned int gReplayCompactedBytes;
 
 // Real-hardware stage changes used to stop in EclManager::Unload(), inside
 // one of the two newlib free() calls.  ECL data is immutable after Load(), and
@@ -93,7 +95,7 @@ bool BossDeathTraceArmingEnabled()
 
 bool DetailedStageTransitionTracing()
 {
-#if defined(TH06_PSP_STAGE_SOAK)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK)
     return true;
 #else
     return th06_psp_periodic_diag_enabled() != 0;
@@ -389,7 +391,7 @@ extern "C" unsigned int th06_wrap_gui_update(Gui *gui) asm("__wrap__ZN3Gui8OnUpd
 
 extern "C" unsigned int th06_wrap_gui_update(Gui *gui)
 {
-#if defined(TH06_PSP_STAGE_SOAK)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK)
     // Replay capture does not guarantee that port-side dialogue waits are
     // dismissed.  This input is injected after Player/Enemy updates and only
     // for the PPSSPP soak executable, so it advances text without changing
@@ -854,8 +856,9 @@ extern "C" long th06_wrap_game_manager_register()
     }
     if (stageReinit)
     {
-        th06_psp_boot_notef("STAGE REINIT REGISTER END R%ld NOW%ld S%ldKB", result,
-                            g_GameManager.currentStage, CurrentStackFreeKb());
+        th06_psp_boot_notef("STAGE REINIT REGISTER END R%ld NOW%ld S%ldKB RC%uKB", result,
+                            g_GameManager.currentStage, CurrentStackFreeKb(), gReplayCompactedBytes / 1024u);
+        gReplayCompactedBytes = 0;
         __atomic_store_n(&gStageReinitTrace, 0, __ATOMIC_RELEASE);
     }
     else if (stageReinitAttempt)
@@ -864,8 +867,10 @@ extern "C" long th06_wrap_game_manager_register()
         // phase records are available only with TH06PSP_DIAG.ON so ordinary
         // stage changes do not fight BGM reads on the Memory Stick.
         const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
-        th06_psp_boot_notef("STAGE REINIT RESULT R%ld NOW%ld H%u/%uKB", result,
-                            g_GameManager.currentStage, heap.usedBytes / 1024u, heap.freeBytes / 1024u);
+        th06_psp_boot_notef("STAGE REINIT RESULT R%ld NOW%ld H%u/%uKB RC%uKB", result,
+                            g_GameManager.currentStage, heap.usedBytes / 1024u, heap.freeBytes / 1024u,
+                            gReplayCompactedBytes / 1024u);
+        gReplayCompactedBytes = 0;
     }
     return result;
 }
@@ -918,9 +923,61 @@ TH06_WRAP_STAGE_VOID("_ZN6Player8CutChainEv", cut_player)
 TH06_WRAP_STAGE_VOID("_ZN12EnemyManager8CutChainEv", cut_enemies)
 TH06_WRAP_STAGE_VOID("_ZN13EffectManager8CutChainEv", cut_effects)
 TH06_WRAP_STAGE_VOID("_ZN3Gui8CutChainEv", cut_gui)
-TH06_WRAP_STAGE_VOID("_ZN13ReplayManager13StopRecordingEv", stop_replay)
 
 #undef TH06_WRAP_STAGE_VOID
+
+extern "C" void th06_real_stop_replay() asm("__real__ZN13ReplayManager13StopRecordingEv");
+extern "C" void th06_wrap_stop_replay() asm("__wrap__ZN13ReplayManager13StopRecordingEv");
+
+extern "C" void th06_wrap_stop_replay()
+{
+    const bool trace = __atomic_load_n(&gStageReinitTrace, __ATOMIC_ACQUIRE) != 0;
+    if (trace)
+        th06_psp_boot_note("stop_replay BEGIN");
+
+    gReplayCompactedBytes = 0;
+    th06_real_stop_replay();
+
+    ReplayManager *manager = g_ReplayManager;
+    const int stageIndex = g_GameManager.currentStage - 1;
+    if (manager != nullptr && !manager->IsDemo() && manager->replayData != nullptr && stageIndex >= 0 &&
+        stageIndex < 7)
+    {
+        StageReplayData *stage = manager->replayData->stageReplayData[stageIndex];
+        const ReplayDataInput *bookmark = manager->replayInputStageBookmarks[stageIndex];
+        if (stage != nullptr && bookmark != nullptr)
+        {
+            const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(stage);
+            const std::uintptr_t end = reinterpret_cast<std::uintptr_t>(bookmark);
+            const std::uintptr_t replayInput = reinterpret_cast<std::uintptr_t>(manager->replayInputs);
+            const std::size_t minimumBytes = offsetof(StageReplayData, replayInputs);
+            if (end >= begin + minimumBytes && end <= begin + sizeof(StageReplayData) &&
+                replayInput >= begin && replayInput < end)
+            {
+                const std::size_t usedBytes = static_cast<std::size_t>(end - begin);
+                const std::size_t replayInputOffset = static_cast<std::size_t>(replayInput - begin);
+                if (usedBytes < sizeof(StageReplayData))
+                {
+                    void *shrunk = std::realloc(stage, usedBytes);
+                    if (shrunk != nullptr)
+                    {
+                        auto *relocated = static_cast<StageReplayData *>(shrunk);
+                        manager->replayData->stageReplayData[stageIndex] = relocated;
+                        manager->replayInputs = reinterpret_cast<ReplayDataInput *>(
+                            reinterpret_cast<unsigned char *>(relocated) + replayInputOffset);
+                        manager->replayInputStageBookmarks[stageIndex] = reinterpret_cast<ReplayDataInput *>(
+                            reinterpret_cast<unsigned char *>(relocated) + usedBytes);
+                        gReplayCompactedBytes = sizeof(StageReplayData) - usedBytes;
+                    }
+                }
+            }
+        }
+    }
+
+    if (trace)
+        th06_psp_boot_notef("stop_replay END S%ldKB RC%uKB", CurrentStackFreeKb(),
+                            gReplayCompactedBytes / 1024u);
+}
 
 extern "C" void th06_wrap_ecl_unload(EclManager *manager) asm("__wrap__ZN10EclManager6UnloadEv");
 
@@ -1216,13 +1273,16 @@ extern "C" unsigned int th06_psp_player_update(Player *player)
         nextSnapshot += 600;
     }
 #endif
-#if defined(TH06_PSP_STAGE_SOAK)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK)
     static int observedStage = -1;
+    static unsigned int soakStageFrames;
     if (g_GameManager.currentStage != observedStage)
     {
         observedStage = g_GameManager.currentStage;
+        soakStageFrames = 0;
         th06_psp_boot_notef("SOAK STAGE %d ENTER", observedStage);
     }
+    ++soakStageFrames;
     // The original replay can desync when the port cannot sustain the exact
     // source frame cadence.  Preserve its movement/shooting stream but prevent
     // a timing-only collision from ending this transition test.
@@ -1232,11 +1292,23 @@ extern "C" unsigned int th06_psp_player_update(Player *player)
         player->playerState = PLAYER_STATE_INVULNERABLE;
         player->invulnerabilityTimer.SetCurrent(2);
     }
+#if defined(TH06_PSP_RECORD_SOAK)
+    // Exercise the normal recording/compaction path without making the test
+    // wait for three complete stage scripts. GameManager::RegisterChain does
+    // the ordinary stage increment; only the test transition trigger is fake.
+    if (g_ReplayManager != nullptr && g_GameManager.currentStage <= 3 && soakStageFrames >= 300 &&
+        g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER)
+    {
+        th06_psp_boot_notef("RECORD SOAK FORCE END S%ld", g_GameManager.currentStage);
+        g_Supervisor.curState = SUPERVISOR_STATE_GAMEMANAGER_REINIT;
+    }
+#endif
 #endif
     return th06_psp_real_player_update(player);
 }
 
-#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_REPLAY_TRACE) || defined(TH06_PSP_PS3_REPLAY)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_REPLAY_TRACE) || \
+    defined(TH06_PSP_PS3_REPLAY)
 extern "C" unsigned int th06_psp_stage_soak_menu_update(MainMenu *)
 {
     static bool started;
@@ -1263,13 +1335,23 @@ extern "C" unsigned int th06_psp_stage_soak_menu_update(MainMenu *)
 #endif
         g_GameManager.livesRemaining = 2;
         g_GameManager.bombsRemaining = 3;
+#if defined(TH06_PSP_RECORD_SOAK)
+        g_GameManager.isInReplay = 0;
+#else
         g_GameManager.isInReplay = 1;
+#endif
         g_GameManager.isInPracticeMode = 0;
         g_GameManager.demoMode = 0;
+#if defined(TH06_PSP_RECORD_SOAK)
+        g_GameManager.replayFile[0] = '\0';
+#else
         std::strcpy(reinterpret_cast<char *>(g_GameManager.replayFile), "replay/th6_01.rpy");
+#endif
         g_Supervisor.framerateMultiplier = 1.0f;
         g_Supervisor.curState = SUPERVISOR_STATE_GAMEMANAGER;
-#if defined(TH06_PSP_REPLAY_TRACE)
+#if defined(TH06_PSP_RECORD_SOAK)
+        th06_psp_boot_note("RECORD SOAK NORMAL REIMUA");
+#elif defined(TH06_PSP_REPLAY_TRACE)
         th06_psp_boot_note("EXACT REPLAY TRACE th6_01 STAGE1");
 #elif defined(TH06_PSP_PS3_REPLAY)
         th06_psp_boot_note("PS3 REPLAY AUTO th6_01 EXTRA MARISAA");
@@ -1303,7 +1385,8 @@ extern "C" int th06_wrap_add_calc_chain(Chain *chain, ChainElem *elem, int prior
             elem->callback = reinterpret_cast<ChainCallback>(th06_wrap_effects_update);
         else if (callback == reinterpret_cast<ChainCallback>(th06_psp_real_player_update))
             elem->callback = reinterpret_cast<ChainCallback>(th06_psp_player_update);
-#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_REPLAY_TRACE) || defined(TH06_PSP_PS3_REPLAY)
+#if defined(TH06_PSP_STAGE_SOAK) || defined(TH06_PSP_RECORD_SOAK) || defined(TH06_PSP_REPLAY_TRACE) || \
+    defined(TH06_PSP_PS3_REPLAY)
         else if (callback == reinterpret_cast<ChainCallback>(th06_psp_real_main_menu_update))
             elem->callback = reinterpret_cast<ChainCallback>(th06_psp_stage_soak_menu_update);
 #endif

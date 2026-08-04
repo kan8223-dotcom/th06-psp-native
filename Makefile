@@ -54,6 +54,12 @@ ifeq ($(STAGE_SOAK),1)
 CXXFLAGS += -DTH06_PSP_STAGE_SOAK
 PSP_EBOOT_TITLE := TH06 PSP stage soak test
 endif
+# make RECORD_SOAK=1 -- PPSSPP-only unattended normal-play recording test.
+# Unlike STAGE_SOAK this allocates and compacts the per-stage replay buffers.
+ifeq ($(RECORD_SOAK),1)
+CXXFLAGS += -DTH06_PSP_RECORD_SOAK
+PSP_EBOOT_TITLE := TH06 PSP record soak test
+endif
 # make REPLAY_TRACE=1 -- replay the user's stage-1 capture without input
 # injection or invulnerability, and trace only a genuinely lethal boss hit.
 # Keep this as a separate diagnostic executable; never ship it as the normal
@@ -69,7 +75,7 @@ CXXFLAGS += -DTH06_PSP_PS3_REPLAY
 PSP_EBOOT_TITLE := Touhou 6 PSP PS3 replay
 endif
 LIBS := -L$(MECC_BUILD_DIR) -lme-core \
-        -lpspgum -lpspgu -lpspdisplay -lpspctrl -lpsppower -lpspaudio \
+        -lpspgum_vfpu -lpspvfpu -lpspgu -lpspdisplay -lpspctrl -lpsppower -lpspaudio \
         -lfreetype -lbz2 -lpng16 -ljpeg -lz -lm -lstdc++ -lsupc++ -lpspsdk \
         -Wl,--wrap=fopen -Wl,--wrap=_Znwj \
         -Wl,--wrap=_ZN11Pbg3Archive4LoadEPKc \

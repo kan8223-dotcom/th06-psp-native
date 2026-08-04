@@ -902,7 +902,9 @@ class PspGuGfx final : public GfxInterface
         const unsigned long long geEndUs = sceKernelGetSystemTimeWide();
         if (firstPresent)
             th06_psp_boot_note("GE FIRST SYNC OK");
+#if !defined(TH06_PSP_RECORD_SOAK)
         sceDisplayWaitVblankStart();
+#endif
         const unsigned long long vblankEndUs = sceKernelGetSystemTimeWide();
         sceGuSwapBuffers();
         if (traceTransitionSwap)

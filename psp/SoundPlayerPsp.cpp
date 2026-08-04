@@ -101,7 +101,16 @@ struct BgmCacheBlock
     alignas(64) i16 pcm[kBgmCacheFrames * 2];
     u32 startFrame;
     u32 frames;
-    bool valid;
+    u32 requestedStartFrame;
+    u32 requestedGeneration;
+    volatile u32 state;
+};
+
+enum BgmCacheState : u32
+{
+    BGM_CACHE_EMPTY = 0,
+    BGM_CACHE_FILLING = 1,
+    BGM_CACHE_READY = 2,
 };
 
 struct PspBgmStream
@@ -110,6 +119,7 @@ struct PspBgmStream
     u32 dataOffset;
     u32 dataBytes;
     BgmCacheBlock blocks[2];
+    volatile u32 generation;
     u32 fills;
     u32 shortReads;
 };
@@ -125,6 +135,10 @@ volatile u32 gPspAudioMaxProducerGapUs;
 volatile u32 gPspAudioMaxMixUs;
 volatile u32 gPspAudioMaxBgmReadUs;
 volatile u32 gPspAudioMixCalls;
+SceUID gBgmPrefetchSema = -1;
+SceUID gBgmPrefetchThread = -1;
+volatile bool gBgmPrefetchAlive;
+std::mutex gBgmFileMutex;
 
 void RecordPspAudioMaximum(volatile u32 *value, u32 sample)
 {
@@ -143,9 +157,27 @@ bool BgmIsOpen()
 
 void CloseBgmUnlocked(SoundPlayer *player)
 {
+    // Revoke queued I/O before waiting for an in-flight read.  The reader owns
+    // the FILE cursor under gBgmFileMutex and will discard an old-generation
+    // result rather than publishing it into a newly opened song.
+    __atomic_add_fetch(&gBgmStream.generation, 1u, __ATOMIC_ACQ_REL);
+    gBgmFileMutex.lock();
     if (gBgmStream.file != nullptr)
         SDL_RWclose(gBgmStream.file);
-    gBgmStream = PspBgmStream{};
+    gBgmStream.file = nullptr;
+    gBgmStream.dataOffset = 0;
+    gBgmStream.dataBytes = 0;
+    gBgmStream.fills = 0;
+    gBgmStream.shortReads = 0;
+    for (BgmCacheBlock &block : gBgmStream.blocks)
+    {
+        block.startFrame = 0;
+        block.frames = 0;
+        block.requestedStartFrame = 0;
+        block.requestedGeneration = 0;
+        __atomic_store_n(&block.state, BGM_CACHE_EMPTY, __ATOMIC_RELEASE);
+    }
+    gBgmFileMutex.unlock();
     player->backgroundMusic.srcWav.data = nullptr;
     player->backgroundMusic.srcWav.samples = 0;
     player->backgroundMusic.pos = 0;
@@ -155,13 +187,14 @@ void CloseBgmUnlocked(SoundPlayer *player)
     player->backgroundMusic.fadeoutProgress = 0;
 }
 
-bool FillBgmBlock(int index, u32 startFrame)
+bool FillBgmBlockLocked(int index, u32 startFrame, u32 generation)
 {
-    if (!BgmIsOpen() || index < 0 || index > 1 || startFrame >= gBgmStream.dataBytes / 4)
+    if (!BgmIsOpen() || index < 0 || index > 1 ||
+        generation != __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE) ||
+        startFrame >= gBgmStream.dataBytes / 4)
         return false;
 
     BgmCacheBlock &block = gBgmStream.blocks[index];
-    block.valid = false;
     const u32 totalFrames = gBgmStream.dataBytes / 4;
     const u32 requestedFrames = std::min(kBgmCacheFrames, totalFrames - startFrame);
     const u32 requestedBytes = requestedFrames * 4;
@@ -182,7 +215,7 @@ bool FillBgmBlock(int index, u32 startFrame)
                           static_cast<u32>(sceKernelGetSystemTimeWide() - readStartUs));
 #endif
     const u32 framesRead = bytesRead / 4;
-    if (framesRead == 0)
+    if (framesRead == 0 || generation != __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE))
         return false;
 #ifdef TH06_PSP
     // ME reads the physical backing store, not the SC's dirty cache lines.
@@ -190,11 +223,90 @@ bool FillBgmBlock(int index, u32 startFrame)
 #endif
     block.startFrame = startFrame;
     block.frames = framesRead;
-    block.valid = true;
     ++gBgmStream.fills;
     if (bytesRead != requestedBytes)
         ++gBgmStream.shortReads;
+    __atomic_store_n(&block.state, BGM_CACHE_READY, __ATOMIC_RELEASE);
     return true;
+}
+
+bool FillBgmBlockNow(int index, u32 startFrame)
+{
+    BgmCacheBlock &block = gBgmStream.blocks[index];
+    const u32 generation = __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE);
+    block.requestedStartFrame = startFrame;
+    block.requestedGeneration = generation;
+    __atomic_store_n(&block.state, BGM_CACHE_FILLING, __ATOMIC_RELEASE);
+    const bool filled = FillBgmBlockLocked(index, startFrame, generation);
+    if (!filled && generation == __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE))
+        __atomic_store_n(&block.state, BGM_CACHE_EMPTY, __ATOMIC_RELEASE);
+    return filled;
+}
+
+int BgmPrefetchThread(SceSize, void *)
+{
+    while (__atomic_load_n(&gBgmPrefetchAlive, __ATOMIC_ACQUIRE))
+    {
+        sceKernelWaitSema(gBgmPrefetchSema, 1, nullptr);
+        if (!__atomic_load_n(&gBgmPrefetchAlive, __ATOMIC_ACQUIRE))
+            break;
+
+        for (int index = 0; index < 2; ++index)
+        {
+            BgmCacheBlock &block = gBgmStream.blocks[index];
+            if (__atomic_load_n(&block.state, __ATOMIC_ACQUIRE) != BGM_CACHE_FILLING)
+                continue;
+
+            const u32 startFrame = block.requestedStartFrame;
+            const u32 generation = block.requestedGeneration;
+            gBgmFileMutex.lock();
+            const bool filled = FillBgmBlockLocked(index, startFrame, generation);
+            gBgmFileMutex.unlock();
+            if (!filled && generation == __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE) &&
+                block.requestedGeneration == generation)
+            {
+                __atomic_store_n(&block.state, BGM_CACHE_EMPTY, __ATOMIC_RELEASE);
+            }
+        }
+    }
+    sceKernelExitThread(0);
+    return 0;
+}
+
+bool StartBgmPrefetchThread()
+{
+    if (gBgmPrefetchThread >= 0)
+        return true;
+    gBgmPrefetchSema = sceKernelCreateSema("th06_bgm_io_sem", 0, 0, 2, nullptr);
+    if (gBgmPrefetchSema < 0)
+        return false;
+    __atomic_store_n(&gBgmPrefetchAlive, true, __ATOMIC_RELEASE);
+    gBgmPrefetchThread = sceKernelCreateThread("th06_bgm_io", BgmPrefetchThread, 0x30, 0x4000,
+                                                PSP_THREAD_ATTR_USER, nullptr);
+    if (gBgmPrefetchThread < 0 || sceKernelStartThread(gBgmPrefetchThread, 0, nullptr) < 0)
+    {
+        __atomic_store_n(&gBgmPrefetchAlive, false, __ATOMIC_RELEASE);
+        if (gBgmPrefetchThread >= 0)
+            sceKernelDeleteThread(gBgmPrefetchThread);
+        sceKernelDeleteSema(gBgmPrefetchSema);
+        gBgmPrefetchThread = -1;
+        gBgmPrefetchSema = -1;
+        return false;
+    }
+    return true;
+}
+
+void StopBgmPrefetchThread()
+{
+    if (gBgmPrefetchThread < 0)
+        return;
+    __atomic_store_n(&gBgmPrefetchAlive, false, __ATOMIC_RELEASE);
+    sceKernelSignalSema(gBgmPrefetchSema, 1);
+    sceKernelWaitThreadEnd(gBgmPrefetchThread, nullptr);
+    sceKernelDeleteThread(gBgmPrefetchThread);
+    sceKernelDeleteSema(gBgmPrefetchSema);
+    gBgmPrefetchThread = -1;
+    gBgmPrefetchSema = -1;
 }
 
 int FindBgmBlock(u32 frame)
@@ -202,48 +314,84 @@ int FindBgmBlock(u32 frame)
     for (int i = 0; i < 2; ++i)
     {
         const BgmCacheBlock &block = gBgmStream.blocks[i];
-        if (block.valid && frame >= block.startFrame && frame < block.startFrame + block.frames)
+        if (__atomic_load_n(&block.state, __ATOMIC_ACQUIRE) == BGM_CACHE_READY &&
+            frame >= block.startFrame && frame < block.startFrame + block.frames)
             return i;
     }
     return -1;
 }
 
-int AcquireBgmBlock(u32 frame)
+bool BgmFillAlreadyQueued(u32 frame)
+{
+    const u32 generation = __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE);
+    for (const BgmCacheBlock &block : gBgmStream.blocks)
+    {
+        if (__atomic_load_n(&block.state, __ATOMIC_ACQUIRE) == BGM_CACHE_FILLING &&
+            block.requestedGeneration == generation && frame >= block.requestedStartFrame &&
+            frame < block.requestedStartFrame + kBgmCacheFrames)
+            return true;
+    }
+    return false;
+}
+
+bool RequestBgmBlock(int index, u32 startFrame)
+{
+    if (!BgmIsOpen() || index < 0 || index > 1 || startFrame >= gBgmStream.dataBytes / 4)
+        return false;
+    BgmCacheBlock &block = gBgmStream.blocks[index];
+    if (__atomic_load_n(&block.state, __ATOMIC_ACQUIRE) == BGM_CACHE_FILLING)
+        return false;
+    block.requestedStartFrame = startFrame;
+    block.requestedGeneration = __atomic_load_n(&gBgmStream.generation, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&block.state, BGM_CACHE_FILLING, __ATOMIC_RELEASE);
+    if (gBgmPrefetchSema >= 0 && sceKernelSignalSema(gBgmPrefetchSema, 1) >= 0)
+        return true;
+    __atomic_store_n(&block.state, BGM_CACHE_EMPTY, __ATOMIC_RELEASE);
+    return false;
+}
+
+int AcquireBgmBlock(u32 frame, u32 protectedBlocks)
 {
     int index = FindBgmBlock(frame);
     if (index >= 0)
         return index;
 
-    // Replace the block furthest from the requested source position.  At
-    // normal sequential playback this is the already-consumed older block.
-    int replace = 0;
-    if (!gBgmStream.blocks[0].valid)
-        replace = 0;
-    else if (!gBgmStream.blocks[1].valid)
-        replace = 1;
-    else
+    if (BgmFillAlreadyQueued(frame))
+        return -1;
+
+    // A missed prefetch must never turn back into synchronous FAT I/O on the
+    // mixer. Queue a safe block and let this pass emit silence for the missing
+    // tail. protectedBlocks contains PCM already handed to the current ME job.
+    int replace = -1;
+    for (int candidate = 0; candidate < 2; ++candidate)
     {
-        const u32 distance0 = frame > gBgmStream.blocks[0].startFrame
-                                  ? frame - gBgmStream.blocks[0].startFrame
-                                  : gBgmStream.blocks[0].startFrame - frame;
-        const u32 distance1 = frame > gBgmStream.blocks[1].startFrame
-                                  ? frame - gBgmStream.blocks[1].startFrame
-                                  : gBgmStream.blocks[1].startFrame - frame;
-        replace = distance0 > distance1 ? 0 : 1;
+        if ((protectedBlocks & (1u << candidate)) == 0 &&
+            __atomic_load_n(&gBgmStream.blocks[candidate].state, __ATOMIC_ACQUIRE) != BGM_CACHE_FILLING)
+        {
+            replace = candidate;
+            break;
+        }
     }
-    return FillBgmBlock(replace, frame) ? replace : -1;
+    if (replace >= 0)
+        RequestBgmBlock(replace, frame);
+    return -1;
 }
 
-void PrefetchBgmAfter(int currentBlock, u32 position)
+void PrefetchBgmAfter(SoundPlayer *player, int currentBlock, u32 position, u32 protectedBlocks)
 {
     if (currentBlock < 0)
         return;
     const BgmCacheBlock &block = gBgmStream.blocks[currentBlock];
     const u32 end = block.startFrame + block.frames;
-    if (position > end || end - position > kBgmPrefetchFrames || end >= gBgmStream.dataBytes / 4 ||
-        FindBgmBlock(end) >= 0)
+    const u32 playbackEnd = std::min(end, player->backgroundMusic.loopEnd);
+    if (position > playbackEnd || playbackEnd - position > kBgmPrefetchFrames)
         return;
-    FillBgmBlock(currentBlock ^ 1, end);
+    const u32 next = end < player->backgroundMusic.loopEnd ? end : player->backgroundMusic.loopStart;
+    if (FindBgmBlock(next) >= 0 || BgmFillAlreadyQueued(next))
+        return;
+    const int targetBlock = currentBlock ^ 1;
+    if ((protectedBlocks & (1u << targetBlock)) == 0)
+        RequestBgmBlock(targetBlock, next);
 }
 } // namespace
 
@@ -279,12 +427,21 @@ ZunResult SoundPlayer::InitializeDSound()
         goto fail;
     }
 
+    if (!StartBgmPrefetchThread())
+        goto fail;
+
     this->backgroundMusicThreadHandle = std::thread(&SoundPlayer::BackgroundMusicPlayerThread, this);
 
     g_GameErrorContext.Log(TH_DBG_SOUNDPLAYER_INIT_SUCCESS);
     return ZUN_SUCCESS;
 
 fail:
+    StopBgmPrefetchThread();
+    if (this->audioDev != 0)
+    {
+        SDL_CloseAudioDevice(this->audioDev);
+        this->audioDev = 0;
+    }
     g_GameErrorContext.Log(TH_ERR_SOUNDPLAYER_FAILED_TO_INITIALIZE_OBJECT);
     return ZUN_ERROR;
 }
@@ -296,6 +453,7 @@ ZunResult SoundPlayer::Release(void)
     this->terminateFlag = false;
 
     StopBGM();
+    StopBgmPrefetchThread();
 
     for (int i = 0; i < ARRAY_SIZE_SIGNED(this->soundBuffers); i++)
     {
@@ -349,6 +507,7 @@ ZunResult SoundPlayer::LoadWav(const char *path)
     u32 riffSize;
     u32 wavDataSize;
     u32 dataOffset;
+    bool firstBlockReady = false;
     Th06PspHeapSnapshot heap;
 
     if (this->audioDev == 0)
@@ -474,17 +633,30 @@ ZunResult SoundPlayer::LoadWav(const char *path)
     // is only a non-null compatibility sentinel; PSP mixing never dereferences
     // it and never allocates wavDataSize bytes.
     this->soundBufMutex.lock();
-    gBgmStream = PspBgmStream{};
+    gBgmFileMutex.lock();
     gBgmStream.file = fileStream;
     gBgmStream.dataOffset = dataOffset;
     gBgmStream.dataBytes = wavDataSize;
-    if (!FillBgmBlock(0, 0))
+    gBgmStream.fills = 0;
+    gBgmStream.shortReads = 0;
+    for (BgmCacheBlock &block : gBgmStream.blocks)
+    {
+        block.startFrame = 0;
+        block.frames = 0;
+        block.requestedStartFrame = 0;
+        block.requestedGeneration = 0;
+        __atomic_store_n(&block.state, BGM_CACHE_EMPTY, __ATOMIC_RELEASE);
+    }
+    firstBlockReady = FillBgmBlockNow(0, 0);
+    if (firstBlockReady)
+        FillBgmBlockNow(1, gBgmStream.blocks[0].frames);
+    gBgmFileMutex.unlock();
+    if (!firstBlockReady)
     {
         CloseBgmUnlocked(this);
         this->soundBufMutex.unlock();
         return ZUN_ERROR;
     }
-    FillBgmBlock(1, gBgmStream.blocks[0].frames);
     fileStream = nullptr; // owned by gBgmStream from here
     this->backgroundMusic.srcWav.data = reinterpret_cast<i16 *>(1);
     this->backgroundMusic.loopStart = 0;
@@ -846,6 +1018,7 @@ void SoundPlayer::MixAudio(u32 samples)
     if (BgmIsOpen())
     {
         u32 samplesMixed = 0;
+        u32 protectedBgmBlocks = 0;
         f32 fadeoutMult;
 
         if (this->backgroundMusic.fadeoutLen != 0)
@@ -872,10 +1045,9 @@ void SoundPlayer::MixAudio(u32 samples)
                 }
             }
 
-            const int blockIndex = AcquireBgmBlock(this->backgroundMusic.pos);
+            const int blockIndex = AcquireBgmBlock(this->backgroundMusic.pos, protectedBgmBlocks);
             if (blockIndex < 0)
             {
-                CloseBgmUnlocked(this);
                 break;
             }
             const BgmCacheBlock &block = gBgmStream.blocks[blockIndex];
@@ -888,6 +1060,7 @@ void SoundPlayer::MixAudio(u32 samples)
             // offset while avoiding all per-sample work on SC when ME is on.
 #ifdef TH06_PSP
             addMixInput(bgm, samplesToMix, samplesMixed, 2, fadeoutMult);
+            protectedBgmBlocks |= 1u << blockIndex;
 #else
             i32 *out = gWideMix + static_cast<size_t>(samplesMixed) * 2;
 
@@ -900,7 +1073,7 @@ void SoundPlayer::MixAudio(u32 samples)
 
             this->backgroundMusic.pos += samplesToMix;
             samplesMixed += samplesToMix;
-            PrefetchBgmAfter(blockIndex, this->backgroundMusic.pos);
+            PrefetchBgmAfter(this, blockIndex, this->backgroundMusic.pos, protectedBgmBlocks);
 
             if (this->backgroundMusic.pos == this->backgroundMusic.loopEnd)
             {

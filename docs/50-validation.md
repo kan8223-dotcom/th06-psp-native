@@ -653,3 +653,29 @@ NaNをGEへ渡さないため削除しない。
   `163e4e41a9a486e84a52d4e28b1b92668a9132a2c766308419ad12b785559525`、配布ZIPは
   `1a33160f03668b9c22bb81eed242d37393eecf0f285435598cb77f5a938f3f49`。preflightは違反0・警告0、
   release auditは原作data/replay/score/廃止済みMECC名の混入が0件だった。
+
+## V-025 PSP-1000録画領域縮小とBGM非同期prefetch (2026-08-04)
+
+- PPSSPP v1.20.4の`PSPModel=0`通常録画testで面1・2・3を順に終了し、各面の
+  `StopRecording()`後に`RC421KB`、計約1.23MiBを回収した。続く面4の
+  Stage/Player/Bullet/Enemy/ECL/Effect/Gui登録と`bgm/th06_08.wav`読込は全て成功し、
+  `STAGE REINIT REGISTER END R0 NOW4`まで通った。証拠は
+  `backups/PPSSPP_PSP1000_RECORD_COMPACT_3STAGE_20260804.LOG`。PSP-1000実機の三面→四面は未確認。
+- BGM block readを専用threadへ移したPPSSPP 32MB診断では、最大readが262,978usの窓でも
+  mixer最大169us、producer gap最大2,757us、PCM queue 3,072 framesを維持し、起動後のunderrun増分は
+  0だった。証拠は`backups/PPSSPP_PSP1000_ASYNC_BGM_20260804.LOG`。Memory Stick実機のlamp/stutterは
+  未確認。
+- block容量は192KiB×2のままで、曲開始時だけ二blockを同期充填する。定常mixer pathに
+  `SDL_RWseek/read`は無く、原作WAVと一時圧縮fileを変更・生成しない。
+
+## V-026 VFPU版libGUM予選 (2026-08-04)
+
+- main thread属性は従来どおり`USER | VFPU`。linkを`libpspgum_vfpu + libpspvfpu`へ変更した最終ELFで
+  `pspvfpu_initcontext`、`pspvfpu_use_matrices`、`sceGumLoadMatrix`を解決し、disassemblyに
+  `vmidt.q`、`lv.q`、`sv.q`が存在することを確認した。
+- PPSSPP v1.20.4の64MB modelで原作archive、font、title BGMを開き、初回GE submit/sync/swapと
+  60frame boot診断を完走した。証拠は`backups/PPSSPP_VFPU_GUM_DEPLOYED_HASH_SMOKE_20260804.LOG`。
+- EBOOT.PBPは3,010,358 bytes、SHA-256
+  `0b11919fe97e73ff88038fb928488e69adbba9ad773f11834954c12bca80a27c`。G:へ転送後のSHA-256一致を確認。
+  PSP-3000実機のFPS差と
+  PSP-1000実機のVFPU/alignment挙動は未測定であり、PPSSPP結果を実機性能値として扱わない。

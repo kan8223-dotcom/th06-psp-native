@@ -269,3 +269,43 @@ GameManagerの同期登録境界でGE listを完了させ、生存textureが借�
 PSP-1000実機は同じ版でtitle demoを完走し、titleへ復帰後も継続動作した。
 Memory Stick lampと同期する短い停止は残っており、D-016で残件としたBGM同期readの
 非同期prefetch化として別に扱う。
+
+## D-025: 終了面のreplay録画領域は実使用範囲へ縮小する
+
+2026-08-04。PSP-1000の通常playは3面終了後、4面ECLの60,796 bytes固定arenaへのcopyまで
+成功したが、次のEffectManager登録中に停止した。同じ順序のPPSSPP 32MB soakは4面まで通るが、
+そちらはreplay再生であり、通常playの録画用確保を通らない。
+
+`StageReplayData`は1面ごとに432,000 bytesを確保し、入力変化だけを追記するにもかかわらず
+replay保存まで最大領域を保持する。3面終了時は約1.24MiBが旧面の予備領域として残る。
+製品replayの各面section実使用量は約5–11KiBで、`SaveReplay()`もbookmarkまでしか出力しない。
+
+PSPの`ReplayManager::StopRecording()` wrapperは終端record追加後、完了面のbufferをbookmarkまで
+`realloc`縮小し、`stageReplayData`、`replayInputs`、`replayInputStageBookmarks`を移動後の住所へ更新する。
+現在面は従来どおり最大領域を持ち、縮小失敗時も元のpointer/容量で続行する。
+`src/`、録画入力、disk format、scoreは変更しない。
+
+## D-026: BGMのMemory Stick readはmixer threadから分離する
+
+2026-08-04。PSP-1000ではBGM再生中のMemory Stick lamp点灯と短い停止が同期し、既存計測でも
+192KiB blockのreadに最大296msを要した。旧実装は音声生成thread自身が次blockを同期readするため、
+cache量を増やしてもread中はPCM供給が止まる。
+
+PSP版は既存の192KiB×2 blockを増やさず、専用user threadが次blockを先読みする。mixerはFAT I/Oを
+一切行わず、未着時はそのpassの不足部分を無音にして要求だけをqueueする。曲切替はgenerationで旧要求を
+失効させ、MEへ渡したblockはjob完了まで上書き対象にしない。原作WAVはread-onlyのままである。
+
+WAVからMP3への実行時変換は採らない。PSPSDKのMP3 APIはdecoderでencoderではなく、MECC音声mixと
+同時使用するencoderの実機実績も無い。I/O停止の直接原因は圧縮率ではなくmixer上の同期readなので、
+まず責務分離で直す。
+
+## D-027: PSP描画backendはVFPU版libGUMを使う
+
+2026-08-04。main threadは当初から`THREAD_ATTR_VFPU`を持つ一方、Makefileはscalar版
+`libpspgum`へlinkしていた。PSPSDK同梱の`libpspgum_vfpu`と`libpspvfpu`へ切り替え、GUMの
+matrix state/copy/multiplyをVFPUで実行する。`ScePspFMatrix4`とbackend一時matrixはいずれも
+16-byte alignmentを満たす。
+
+これはGE描画やSC側の全処理を自動でSIMD化するものではない。現在の`Draw()`はengineのinterleaved
+vertexをGE layoutへC++ loopで詰め替えており、draw chain全体にもsprite生成が残る。従って
+PSP-3000の16.7ms超過を減らす安全な一段目として採用し、改善量は同じ実機PERF窓で比較する。
