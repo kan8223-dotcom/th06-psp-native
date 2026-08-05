@@ -726,3 +726,19 @@ NaNをGEへ渡さないため削除しない。
   通常EBOOTは3,015,734 bytes、SHA-256
   `bd643ddd9131f1db74b7d4cab14dad310c796149789bd98e9ad1ccd4f6639d8d`。preflight違反0/警告0、
   release auditは原作data/replay/score/test marker混入0件で、G:上のhashも一致した。
+
+## V-029 replay保存二重終端の実機回帰 (2026-08-05)
+
+- PSP-3000のLunatic通しplayは6面・ending・staff rollまで完走した後、
+  `REPLAY SAVE BEGIN ./replay/th6_02.rpy` の直後に停止した。保存前に完了面の録画bufferを
+  `realloc`縮小していた一方、`SaveReplay()`内の同一翻訳単位からの二度目の
+  `StopRecording()`はlinker wrapperを迂回し、縮小後のallocation外へ終端recordを書いていた。
+- 保存完了まで録画bufferを元サイズで保持する修正後、専用testは通常録画を開始し、300frameで
+  wrapper経由の一度目のStopと`SaveReplay()`内部の二度目のStopを連続実行した。PPSSPP v1.20.4と
+  PSP-3000実機の両方で`REPLAY SAVE END`へ到達し、生成fileの再読込は
+  `SAVE REGRESSION VERIFY R0 B136`となった。
+- 実機証拠は`C:\Users\kan82\TH06PSP_SAVE_REGRESSION_HW_20260805.LOG`、SHA-256
+  `1c379e69e308e291b591efae43d5b140026322c550f8d3b7e326b98c31999c54`。
+  test EBOOTと`SAVEFIX.RPY`は実機から撤去し、無限残機＋保存修正版EBOOT
+  (`71172f8dc5e46c43da27a187d48246ba901ccb932e97f0d027d78f730d7645a9`)へ復元した。
+  test用compile pathは通常sourceから除去済みで、配布物には含めない。

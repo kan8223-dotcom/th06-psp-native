@@ -285,6 +285,17 @@ PSPの`ReplayManager::StopRecording()` wrapperは終端record追加後、完了�
 現在面は従来どおり最大領域を持ち、縮小失敗時も元のpointer/容量で続行する。
 `src/`、録画入力、disk format、scoreは変更しない。
 
+## D-030: replay保存前の録画領域は縮小しない
+
+2026-08-05、PSP-3000実機で6面クリアからエンディングまで到達後、
+`REPLAY SAVE BEGIN ./replay/th6_02.rpy` の直後に停止した。D-025の
+`StopRecording()` wrapperが終端recordを追記後に`realloc`縮小していた一方、
+`ReplayManager::SaveReplay()` 内部の二度目の `StopRecording()` 呼出しは同一翻訳単位で
+GNU ldのwrapperを通らず、縮小後のallocationの外に終端recordを書いていた。
+
+録画bufferは保存完了後の通常cleanupまで元サイズで保持する。入力・replay format・score・
+原作engine (`src/`) は変更しない。D-025のメモリ節約より、実機での保存安全性を優先する。
+
 ## D-026: BGMのMemory Stick readはmixer threadから分離する
 
 2026-08-04。PSP-1000ではBGM再生中のMemory Stick lamp点灯と短い停止が同期し、既存計測でも

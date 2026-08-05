@@ -1430,26 +1430,13 @@ extern "C" void th06_wrap_stop_replay()
             if (end >= begin + minimumBytes && end <= begin + sizeof(StageReplayData) &&
                 replayInput >= begin && replayInput < end)
             {
-                const std::size_t usedBytes = static_cast<std::size_t>(end - begin);
-                const std::size_t replayInputOffset = static_cast<std::size_t>(replayInput - begin);
-                if (usedBytes < sizeof(StageReplayData))
-                {
-                    void *shrunk = std::realloc(stage, usedBytes);
-                    if (shrunk != nullptr)
-                    {
-                        auto *relocated = static_cast<StageReplayData *>(shrunk);
-                        manager->replayData->stageReplayData[stageIndex] = relocated;
-                        manager->replayInputs = reinterpret_cast<ReplayDataInput *>(
-                            reinterpret_cast<unsigned char *>(relocated) + replayInputOffset);
-                        manager->replayInputStageBookmarks[stageIndex] = reinterpret_cast<ReplayDataInput *>(
-                            reinterpret_cast<unsigned char *>(relocated) + usedBytes);
-                        gReplayCompactedBytes = sizeof(StageReplayData) - usedBytes;
-                    }
-                }
-
-                // Remember the relocated pointer too. This also makes the
-                // operation idempotent when realloc could not shrink it.
-                gReplayStoppedStages[stageIndex] = manager->replayData->stageReplayData[stageIndex];
+                // SaveReplay() calls StopRecording() a second time after the
+                // player names the replay.  Calls within ReplayManager.cpp
+                // bypass the linker wrapper, so a previously realloc-shrunk
+                // record would receive that second terminator past its true
+                // allocation.  Retain the original allocation until the
+                // save completes; the final cleanup then releases it.
+                gReplayStoppedStages[stageIndex] = stage;
             }
         }
     }
