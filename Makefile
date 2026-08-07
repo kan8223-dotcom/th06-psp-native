@@ -161,8 +161,9 @@ release-audit:
 release: all release-audit psp/assets/NotoSansJP-Regular.ttf
 	@stage_root=$$(mktemp -d); \
 	stage="$$stage_root/TH06PSP"; \
-	mkdir -p "$$stage/licenses/NotoSansJP" "$$stage/licenses/MECC" dist; \
+	mkdir -p "$$stage/docs/images" "$$stage/licenses/NotoSansJP" "$$stage/licenses/MECC" dist; \
 	cp EBOOT.PBP psp/assets/NotoSansJP-Regular.ttf README.md CREDITS.md LICENSE "$$stage/"; \
+	cp docs/images/install-01-copy-folder.png docs/images/install-02-dat-files-reference.png "$$stage/docs/images/"; \
 	cp licenses/NotoSansJP/OFL.txt "$$stage/licenses/NotoSansJP/"; \
 	cp psp/third_party/me-custom-core/LICENSE.md "$$stage/licenses/MECC/"; \
 	stage_win=$$(wslpath -w "$$stage"); \

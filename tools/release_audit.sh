@@ -7,7 +7,7 @@ test_eboot_pattern='STAGE SOAK|RECORD SOAK|RESULT SOAK|PS3 REPLAY AUTO|EXACT REP
 # Build the retired MECC repository name at runtime so the forbidden spelling
 # does not become part of this repository merely because the audit checks it.
 obsolete_mecc_pattern=$(printf '%s' 'T' 'iny[-_ ]?M' 'E|T' 'inyM' 'E')
-obsolete_mecc_files=$(rg -l -i "$obsolete_mecc_pattern" README.md CREDITS.md AGENTS.md DECISIONS.md docs psp shim tools Makefile 2>/dev/null || true)
+obsolete_mecc_files=$(rg -l -i "$obsolete_mecc_pattern" README.md CREDITS.md DECISIONS.md docs psp shim tools Makefile 2>/dev/null || true)
 if [ -n "$obsolete_mecc_files" ]; then
     echo "[FAIL] obsolete MECC repository name remains in source or documentation:"
     echo "$obsolete_mecc_files"

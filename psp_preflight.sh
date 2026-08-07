@@ -1,5 +1,5 @@
 #!/bin/bash
-# psp_preflight — PSP版 憲兵 v1.0 (2026-07-04 Fable期遺産)
+# psp_preflight — PSP版 preflight checks v1.0
 # ビルド前・デプロイ前に既知の地雷を全数検査する。PS3版 ps3_preflight.sh と同思想。
 #
 # 根拠ソース (推測で書いた項目はその旨明記):
