@@ -14,7 +14,7 @@ if [ -n "$obsolete_mecc_files" ]; then
     fail=1
 fi
 
-tracked_forbidden=$(git ls-files | grep -Ei '(^|/)(th6|bgm)(/|$)|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2|PBP|PSP)$|(^|/)score\.dat$' || true)
+tracked_forbidden=$(git ls-files | grep -Ei '(^|/)(th6|bgm)(/|$)|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2|PBP|PSP)$|(^|/)(score\.dat|TH06PSP_DATA_PATH\.TXT)$' || true)
 if [ -n "$tracked_forbidden" ]; then
     echo "[FAIL] proprietary/user/generated files are tracked:"
     echo "$tracked_forbidden"
@@ -27,7 +27,7 @@ if [ -f EBOOT.PBP ] && strings EBOOT.PBP | grep -Eq "$test_eboot_pattern"; then
 fi
 
 if [ -d dist ]; then
-    release_forbidden=$(find dist -type f | grep -Ei '/(th6|bgm)/|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2)$|/score\.dat$' || true)
+    release_forbidden=$(find dist -type f | grep -Ei '/(th6|bgm)/|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2)$|/(score\.dat|TH06PSP_DATA_PATH\.TXT)$' || true)
     if [ -n "$release_forbidden" ]; then
         echo "[FAIL] forbidden files entered dist/:"
         echo "$release_forbidden"
@@ -36,7 +36,7 @@ if [ -d dist ]; then
     for archive in dist/*.zip; do
         [ -f "$archive" ] || continue
         archive_entries=$(unzip -Z1 "$archive" | tr '\\' '/')
-        archive_forbidden=$(printf '%s\n' "$archive_entries" | grep -Ei '(^|/)(th6|bgm)/|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2)$|/score\.dat$' || true)
+        archive_forbidden=$(printf '%s\n' "$archive_entries" | grep -Ei '(^|/)(th6|bgm)/|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2)$|/(score\.dat|TH06PSP_DATA_PATH\.TXT)$' || true)
         if [ -n "$archive_forbidden" ]; then
             echo "[FAIL] forbidden files entered $archive:"
             echo "$archive_forbidden"
@@ -50,7 +50,10 @@ if [ -d dist ]; then
             echo "[FAIL] obsolete MECC repository name entered $archive"
             fail=1
         fi
-        if unzip -p "$archive" TH06PSP/EBOOT.PBP 2>/dev/null | strings | grep -Eq "$test_eboot_pattern"; then
+        # Compress-Archive stores Windows separators.  The wildcard matches the
+        # normalized and backslash forms, so this audit reads the actual EBOOT
+        # instead of silently checking an empty stream under WSL.
+        if unzip -p "$archive" '*EBOOT.PBP' 2>/dev/null | strings | grep -Eq "$test_eboot_pattern"; then
             echo "[FAIL] PPSSPP-only automatic test marker entered $archive"
             fail=1
         fi

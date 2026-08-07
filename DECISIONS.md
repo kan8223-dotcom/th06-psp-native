@@ -343,3 +343,19 @@ matrix state/copy/multiplyをVFPUで実行する。`ScePspFMatrix4`とbackend一
 これはGE描画やSC側の全処理を自動でSIMD化するものではない。現在の`Draw()`はengineのinterleaved
 vertexをGE layoutへC++ loopで詰め替えており、draw chain全体にもsprite生成が残る。従って
 PSP-3000の16.7ms超過を減らす安全な一段目として採用し、改善量は同じ実機PERF窓で比較する。
+
+## D-031: 原作データはEBOOT横を優先し、ms0/ef0直下を限定自動検索する
+
+2026-08-07。推奨配置`TH06PSP/th6`は維持しつつ、PC版フォルダをメモリースティック直下へ
+置く運用とPSP Goの本体ストレージに対応する。検索順は、保存済みの明示選択、EBOOT横の`th6`、
+旧flat配置、EBOOTを起動したdeviceの直下、もう一方の`ms0:`/`ef0:`とする。D-009の教訓に従い、
+PSP Goで内蔵側の古いコピーがメモリースティック側の起動を勝手にshadowしないよう、常に起動deviceを
+先に探索する。
+
+device全体の再帰検索は行わず、root自身とroot直下のfolderだけを調べる。候補採用条件はTH6 1.02fの
+6 DATについて既知sizeと`PBG3` magicが全件一致し、`bgm/th06_01.wav`から`th06_17.wav`までが
+揃うことである。原作rootは引き続きread-only、設定・score・replayのwrite rootはEBOOT横のまま変えない。
+
+起動時SELECTで検出済み候補と`AUTO`を選べる。明示選択だけを
+`TH06PSP_DATA_PATH.TXT`へ保存し、保存先が無効なら自動検索へ戻る。選択情報はuser dataであり、
+repositoryと配布ZIPには含めない。

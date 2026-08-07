@@ -7,7 +7,7 @@
 
 この文書は、TH06 engine (`src/`) を変更せず、PSP固有部分を `shim/` と `psp/` に閉じ込めるための設計である。
 原作 DAT/WAV、製品ISO、SF2をrepo/EBOOTへ含めない。EBOOTはメモリースティックから起動し、
-利用者が所有するPC版TH6フォルダを`TH06PSP/th6`へ丸ごとコピーして供給する。
+利用者が所有するPC版TH6フォルダを`TH06PSP/th6`または`ms0:`/`ef0:`直下へ丸ごとコピーして供給する。
 
 ## 1. 決定済みの前提と未決定事項
 
@@ -15,7 +15,7 @@
 |---|---|---|
 | 開発起動 | 決定 | メモリースティックのEBOOT。認証なし。 |
 | engineの改変 | 禁止 | `src/` にPSP分岐を足さない。必要な適応は `shim/` / `psp/`。 |
-| 原作データ | 決定 | repo/EBOOTへ含めず、利用者所有のPC版TH6フォルダを`th6`へ丸ごと置く。 |
+| 原作データ | 決定 | repo/EBOOTへ含めず、利用者所有のPC版TH6フォルダを`th6`またはdevice直下へ丸ごと置く。 |
 | 出力解像度 | 決定 | 480x272。2026-08-04に田中が決定。 |
 | MIDI/SF2 | **未決定** | SF2 5.7MBを載せるかはメモリ実測後、田中が決める。 |
 | 描画backend | 決定 | PSP GE/GUで直接描画。Software rendererは比較・非常用だけ。 |
@@ -78,11 +78,16 @@ Software backendは色・性能比較とGE初期化失敗時の非常経路と�
 - `SDL_GetTicks64`は`sceKernelGetSystemTimeWide()/1000`、`SDL_Delay`は`sceKernelDelayThread`に対応させる。0固定のstubを残さない。
 - PSPは実用的なprocess CWDを持たない。`psp/fileio.cpp` が GNU ld の
   `--wrap=fopen` でengineの `FileSystem` とSDL RWopsを同時に受ける。XMBが`argv[0]`で渡したEBOOTの
-  親をwritable state root、同階層の`th6`をoriginal data rootとして分離する。`src/`には分岐を加えない。
+  親をwritable state rootとし、同階層の`th6`、起動device直下、もう一方の`ms0:`/`ef0:`直下から
+  original data rootを選んで分離する。device全体は再帰せず、rootと直下1階層だけを調べる。
+  `src/`には分岐を加えない。
   6 DATは日本語long filenameを直接開き、PSP FAT APIで開けない場合は1.02 retailの固有byte sizeと
-  `PBG3` magicでdirectory entryを対応させる。17 WAVは`th6/bgm`から読む。原作rootへ書き込まない。
+  `PBG3` magicでdirectory entryを対応させる。17 WAVも全件存在確認してから候補を採用する。
+  原作rootへ書き込まない。
   `ef0:`側の同名ディレクトリが存在しても、`ms0:`から起動した版をshadowさせない。`argv[0]`が無い
   特殊launcherの場合だけ、従来の`ef0:`存在確認へfallbackする。
+- 起動時SELECTで`AUTO`と検出済み候補を選べる。明示選択はwritable state rootの
+  `TH06PSP_DATA_PATH.TXT`へ保存し、保存先が無効なら自動選択へ戻す。このファイルは配布物に含めない。
 - 開発中は起動ごとに `<storage>:/TH06PSP_BOOT.LOG` を切り詰めて書く。engineへ
   入る前のI/Oなので、音声・描画中に診断I/Oを混ぜない。正式版では不要になれば外す。
 - `ms0:`固定のデータパスやCD探索をengineへ漏らさない。PSP Goの`ef0:`も実際の`argv[0]`に従う。

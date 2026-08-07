@@ -98,6 +98,102 @@ void HoldResultScreen(unsigned int seconds)
         sceDisplayWaitVblankStart();
     }
 }
+
+bool DataSelectorRequested()
+{
+    sceCtrlSetSamplingCycle(0);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+    SceCtrlData pad{};
+    sceCtrlPeekBufferPositive(&pad, 1);
+    return (pad.Buttons & PSP_CTRL_SELECT) != 0;
+}
+
+void DrawDataSelector(unsigned int selectedItem)
+{
+    const unsigned int candidateCount = th06_psp_data_candidate_count();
+    const unsigned int itemCount = candidateCount + 1; // AUTO plus each path
+    constexpr unsigned int kVisibleItems = 9;
+    unsigned int firstItem = selectedItem > 4 ? selectedItem - 4 : 0;
+    if (firstItem + kVisibleItems > itemCount)
+        firstItem = itemCount > kVisibleItems ? itemCount - kVisibleItems : 0;
+
+    th06_psp_video_fill(0xff202020u);
+    th06_psp_text_draw(8, 16, 3, 0xffffffffu, "DATA LOCATION");
+    th06_psp_text_draw(8, 43, 1, 0xffd0d0d0u, "UP/DOWN: CHOOSE  X/START: SAVE  O: CANCEL");
+
+    for (unsigned int row = 0; row < kVisibleItems && firstItem + row < itemCount; ++row)
+    {
+        const unsigned int item = firstItem + row;
+        const char *path = item == 0 ? "AUTO (LAUNCH DEVICE FIRST)"
+                                     : th06_psp_data_candidate_path(item - 1);
+        char line[112];
+        std::snprintf(line, sizeof(line), "%c %s", item == selectedItem ? '>' : ' ', path);
+        th06_psp_text_draw(8, 68 + static_cast<int>(row) * 16, 1,
+                           item == selectedItem ? 0xff80ffffu : 0xffffffffu, line);
+    }
+
+    char status[80];
+    std::snprintf(status, sizeof(status), "%u DATA FOLDER%s FOUND", candidateCount,
+                  candidateCount == 1 ? "" : "S");
+    th06_psp_text_draw(8, 222, 1, 0xffd0d0d0u, status);
+    th06_psp_text_draw(8, 238, 1, 0xffd0d0d0u, "AUTO SEARCHES EBOOT, MS0 AND EF0");
+}
+
+void RunDataSelector()
+{
+    const unsigned int candidateCount = th06_psp_data_candidate_count();
+    if (candidateCount == 0)
+        return;
+
+    unsigned int selectedItem = th06_psp_data_preference_active()
+                                    ? th06_psp_data_candidate_selected() + 1
+                                    : 0;
+    th06_psp_boot_note("DATA SELECTOR OPEN");
+
+    SceCtrlData pad{};
+    do
+    {
+        sceCtrlPeekBufferPositive(&pad, 1);
+        sceDisplayWaitVblankStart();
+    } while (gRunning && (pad.Buttons & PSP_CTRL_SELECT) != 0);
+
+    unsigned int previousButtons = pad.Buttons;
+    bool redraw = true;
+    while (gRunning)
+    {
+        if (redraw)
+        {
+            DrawDataSelector(selectedItem);
+            redraw = false;
+        }
+
+        sceDisplayWaitVblankStart();
+        sceCtrlPeekBufferPositive(&pad, 1);
+        const unsigned int pressed = pad.Buttons & ~previousButtons;
+        previousButtons = pad.Buttons;
+
+        if ((pressed & PSP_CTRL_UP) != 0)
+        {
+            selectedItem = selectedItem == 0 ? candidateCount : selectedItem - 1;
+            redraw = true;
+        }
+        else if ((pressed & PSP_CTRL_DOWN) != 0)
+        {
+            selectedItem = selectedItem == candidateCount ? 0 : selectedItem + 1;
+            redraw = true;
+        }
+        else if ((pressed & (PSP_CTRL_CROSS | PSP_CTRL_START)) != 0)
+        {
+            th06_psp_select_data_candidate(selectedItem == 0 ? -1 : static_cast<int>(selectedItem - 1));
+            return;
+        }
+        else if ((pressed & PSP_CTRL_CIRCLE) != 0)
+        {
+            th06_psp_boot_note("DATA SELECTOR CANCEL");
+            return;
+        }
+    }
+}
 #endif
 
 } // namespace
@@ -139,6 +235,11 @@ int main(int argc, char **argv)
     RecordBootHeader();
     th06_psp_boot_notef("FPU FCR31 %08X>%08X", fcr31Before, fcr31After);
     th06_psp_boot_note("HOLD L+R+START TO QUIT");
+#if !defined(TH06_PSP_BOOT_PROBE)
+    th06_psp_boot_note("HOLD SELECT AT BOOT FOR DATA LOCATION");
+    if (DataSelectorRequested())
+        RunDataSelector();
+#endif
     th06_psp_watchdog_arm(kBootWatchdogSeconds);
 
 #if defined(TH06_PSP_BOOT_PROBE)
@@ -186,7 +287,8 @@ int main(int argc, char **argv)
     if (!th06_psp_original_data_ready())
     {
         th06_psp_boot_note("ORIGINAL TH6 1.02f DATA REQUIRED");
-        th06_psp_boot_note("COPY PC TH6 FOLDER AS TH06PSP/th6");
+        th06_psp_boot_note("COPY PC TH6 FOLDER TO TH06PSP OR DEVICE ROOT");
+        th06_psp_boot_note("AUTO SEARCHED EBOOT, MS0 AND EF0");
         th06_psp_boot_note("NO GAME DATA IS INCLUDED");
         th06_psp_watchdog_disarm();
         HoldResultScreen(15);

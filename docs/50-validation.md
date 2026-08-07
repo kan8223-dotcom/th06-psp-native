@@ -742,3 +742,22 @@ NaNをGEへ渡さないため削除しない。
   test EBOOTと`SAVEFIX.RPY`は実機から撤去し、無限残機＋保存修正版EBOOT
   (`71172f8dc5e46c43da27a187d48246ba901ccb932e97f0d027d78f730d7645a9`)へ復元した。
   test用compile pathは通常sourceから除去済みで、配布物には含めない。
+
+## V-030 原作データ自動検索のPPSSPP回帰 (2026-08-07)
+
+- 実行環境: PPSSPP v1.20.4の隔離memstick。原作フォルダは利用者所有の実データで、repo/EBOOTには
+  含めていない。EBOOT.PBPは3,066,406 bytes、SHA-256
+  `8005acbdbf1bbb9b3f3f8a158a07f38f77b26eaca5dc680089e3b0c8c0c8a8a5`。
+- `ms0:/kouma`だけを置いた条件では`DATA SEARCH AUTO C1`、`DATA C0 ms0:/kouma`、
+  `DATA ms0:/kouma DAT6/6 WAV17/17`を記録し、`ENGINE ENTER`と`FOPEN DATA 紅魔郷IN.DAT OK`まで到達した。
+- `TH06PSP/th6`と`ms0:/kouma`を両方置いた条件では候補2件を検出し、AUTOは
+  `ms0:/PSP/GAME/TH06PSP/th6`を選択した。起動device側の推奨配置を優先する契約と一致した。
+- `TH06PSP_DATA_PATH.TXT`へ`ms0:/kouma`を保存した条件では`DATA SEARCH SAVED C2`となり、root側を
+  選択してDAT読込まで到達した。存在しない`ms0:/missing`へ変えると
+  `DATA SAVED PATH INVALID - AUTO USED`を記録し、推奨配置へ自動復帰した。
+- 原作データを一切置かない条件では`DATA SEARCH AUTO C0`、`DAT0/6 WAV0/17`となり、
+  `ENGINE ENTER`せずインストール不足画面へ留まった。無関係なroot folderは候補にしない。
+- PPSSPPが同じFAT directoryを`kouma`と`KOUMA`の両表記で返す条件も、ASCII case-insensitive比較で
+  1候補へ正規化した。
+- SELECT選択画面は通常EBOOTへ組み込み済みだが、PSP Go実機での操作と`ef0:`/`ms0:`双方の
+  抜き差し・切替は未測定である。PPSSPP結果をPSP Go実機確認の代用にはしない。
