@@ -36,6 +36,11 @@ static const PixelDataType g_TextureFormatTypeMapping[6] = {static_cast<PixelDat
 
 static const u8 g_TextureFormatBytesPerPixel[6] = {0, 4, 2, 2, 3, 2};
 
+#ifdef TH06_PSP
+extern "C" SDL_Surface *th06_psp_img_load_png_scaled_format(const u8 *data, std::size_t size, u32 format,
+                                                             i32 targetWidth, i32 targetHeight);
+#endif
+
 void AnmManager::CreateTextureObject()
 {
     this->currentTextureHandle = g_GfxBackend->CreateTexture();
@@ -44,7 +49,8 @@ void AnmManager::CreateTextureObject()
     g_GfxBackend->SetTextureFilter();
 }
 
-SDL_Surface *AnmManager::LoadToSurfaceWithFormat(const char *filename, SDL_PixelFormatEnum format, u8 **fileData)
+SDL_Surface *AnmManager::LoadToSurfaceWithFormat(const char *filename, SDL_PixelFormatEnum format, u8 **fileData,
+                                                 i32 targetWidth, i32 targetHeight)
 {
     u8 *data;
     SDL_Surface *imageSrcSurface;
@@ -58,7 +64,29 @@ SDL_Surface *AnmManager::LoadToSurfaceWithFormat(const char *filename, SDL_Pixel
         return NULL;
     }
 
-    rwData = SDL_RWFromConstMem(data, g_LastFileSize);
+    const i32 dataSize = g_LastFileSize;
+
+#ifdef TH06_PSP
+    // Decode PNG scanlines directly into the ANM-requested size and format.
+    // This avoids keeping a full RGBA source, a second converted source-size
+    // surface, and a final resized surface alive together. The operations are
+    // byte-identical for the nearest-neighbour resize used below because
+    // per-pixel format conversion commutes with selecting the sampled pixel.
+    static const u8 pngSignature[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    if (targetWidth > 0 && targetHeight > 0 && dataSize >= (i32)sizeof(pngSignature) &&
+        std::memcmp(data, pngSignature, sizeof(pngSignature)) == 0)
+    {
+        imageTargetSurface = th06_psp_img_load_png_scaled_format(data, (std::size_t)dataSize, format, targetWidth,
+                                                                 targetHeight);
+        if (imageTargetSurface != NULL && fileData != NULL)
+            *fileData = data;
+        else
+            std::free(data);
+        return imageTargetSurface;
+    }
+#endif
+
+    rwData = SDL_RWFromConstMem(data, dataSize);
 
     if (rwData == NULL)
     {
@@ -74,9 +102,32 @@ SDL_Surface *AnmManager::LoadToSurfaceWithFormat(const char *filename, SDL_Pixel
         return NULL;
     }
 
-    imageTargetSurface = SDL_ConvertSurfaceFormat(imageSrcSurface, format, 0);
+    // IMG_Load_RW has synchronously consumed the encoded image. Callers that
+    // do not retain it can release the PBG entry before allocating a converted
+    // surface, lowering every fallback decoder peak as well.
+    if (fileData == NULL)
+    {
+        std::free(data);
+        data = NULL;
+    }
 
-    SDL_FreeSurface(imageSrcSurface);
+    // IMG_Load_RW already returns RGBA32 for PNGs in the PSP shim.  Most ANM
+    // portraits request that exact format, so converting them allocated and
+    // copied a second full-size surface only to free the first one
+    // immediately.  During the stage 2 -> 3 transition this made the
+    // 256x256 face06a alpha image need two simultaneous 256 KiB pixel buffers
+    // and exhausted the fragmented PSP-1000 heap.  Reuse the freshly decoded
+    // surface when no conversion is required; ownership is unchanged because
+    // this function already owns imageSrcSurface exclusively.
+    if (imageSrcSurface->format != NULL && imageSrcSurface->format->format == format)
+    {
+        imageTargetSurface = imageSrcSurface;
+    }
+    else
+    {
+        imageTargetSurface = SDL_ConvertSurfaceFormat(imageSrcSurface, format, 0);
+        SDL_FreeSurface(imageSrcSurface);
+    }
 
     if (imageTargetSurface != NULL && fileData != NULL)
     {
@@ -324,8 +375,20 @@ ZunResult AnmManager::LoadTexture(i32 textureIdx, const char *textureName, i32 t
         }
     }
 
+    const AnmRawEntry *entry = this->anmFiles[textureIdx];
+
+#ifdef TH06_PSP
+    // The PSP renderer keeps the decoded pixels in textureData for later
+    // alpha-channel updates; the compressed PNG buffer is never read again.
+    // Release it as soon as decoding finishes instead of retaining it for the
+    // entire stage, where it only adds pressure to the constrained PSP-1000
+    // heap.
+    textureSurface = LoadToSurfaceWithFormat(textureName, g_TextureFormatSDLMapping[textureFormat], NULL,
+                                             entry->width, entry->height);
+#else
     textureSurface = LoadToSurfaceWithFormat(textureName, g_TextureFormatSDLMapping[textureFormat],
                                              (u8 **)&this->textures[textureIdx].fileData);
+#endif
 
     // th06_ps3: NULL check must come before the resize hack (upstream checks after deref)
     if (textureSurface == NULL)
@@ -334,15 +397,24 @@ ZunResult AnmManager::LoadTexture(i32 textureIdx, const char *textureName, i32 t
     }
 
     // Hideous hack to account for ANM entries that report a different texture size than the actual size
-    const AnmRawEntry *entry = this->anmFiles[textureIdx];
     if (textureSurface->w != entry->width || textureSurface->h != entry->height)
     {
         SDL_Surface *textureSurface2 = SDL_CreateRGBSurfaceWithFormat(0, entry->width, entry->height,
                                                                       g_TextureFormatBytesPerPixel[textureFormat] * 8,
                                                                       g_TextureFormatSDLMapping[textureFormat]);
+        if (textureSurface2 == NULL)
+        {
+            SDL_FreeSurface(textureSurface);
+            return ZUN_ERROR;
+        }
         SDL_Rect srcRect = {0, 0, textureSurface->w, textureSurface->h};
         SDL_Rect dstRect = {0, 0, entry->width, entry->height};
-        SDL_BlitScaled(textureSurface, &srcRect, textureSurface2, &dstRect);
+        if (SDL_BlitScaled(textureSurface, &srcRect, textureSurface2, &dstRect) != 0)
+        {
+            SDL_FreeSurface(textureSurface2);
+            SDL_FreeSurface(textureSurface);
+            return ZUN_ERROR;
+        }
         SDL_FreeSurface(textureSurface);
         textureSurface = textureSurface2;
     }
@@ -362,6 +434,11 @@ ZunResult AnmManager::LoadTexture(i32 textureIdx, const char *textureName, i32 t
         {
             SDL_Surface *rgba =
                 SDL_CreateRGBSurfaceWithFormat(0, textureSurface->w, textureSurface->h, 32, SDL_PIXELFORMAT_RGBA32);
+            if (rgba == NULL)
+            {
+                SDL_FreeSurface(textureSurface);
+                return ZUN_ERROR;
+            }
             for (i32 y = 0; y < textureSurface->h; y++)
             {
                 const u8 *sp = (const u8 *)textureSurface->pixels + y * textureSurface->pitch;
@@ -437,14 +514,53 @@ ZunResult AnmManager::LoadTexture(i32 textureIdx, const char *textureName, i32 t
                     (int)textureFormat, matched);
     }
 
+#ifdef TH06_PSP
+    // PSP shim surfaces are tightly packed and privately own their calloc
+    // buffer. Transfer that buffer to TextureData instead of allocating and
+    // copying an identical second image. SDL_FreeSurface still retires the
+    // surface/cache metadata after pixels is detached.
+    if (!(textureSurface->flags & 1) &&
+        textureSurface->pitch == textureSurface->w * g_TextureFormatBytesPerPixel[textureFormat])
+    {
+        rawTextureData = static_cast<u8 *>(textureSurface->pixels);
+        textureSurface->pixels = NULL;
+    }
+    else
+    {
+        const i32 rowBytes = textureSurface->w * g_TextureFormatBytesPerPixel[textureFormat];
+        const std::size_t totalBytes = (std::size_t)rowBytes * textureSurface->h;
+        rawTextureData = static_cast<u8 *>(std::malloc(totalBytes));
+        if (rawTextureData != NULL)
+        {
+            SDL_LockSurface(textureSurface);
+            for (i32 y = 0; y < textureSurface->h; ++y)
+            {
+                std::memcpy(rawTextureData + (std::size_t)y * rowBytes,
+                            static_cast<const u8 *>(textureSurface->pixels) + (std::size_t)y * textureSurface->pitch,
+                            rowBytes);
+            }
+            SDL_UnlockSurface(textureSurface);
+        }
+    }
+#else
+    rawTextureData = ExtractSurfacePixels(textureSurface, g_TextureFormatBytesPerPixel[textureFormat]);
+#endif
+
+    if (rawTextureData == NULL)
+    {
+        SDL_FreeSurface(textureSurface);
+        return ZUN_ERROR;
+    }
+
+    // Do not create a backend handle until every CPU-side allocation has
+    // succeeded. Otherwise an allocation failure above leaves an unreachable
+    // texture object behind during the next stage registration attempt.
     CreateTextureObject();
 
     // Clear any errors that might be pending
     while (g_GfxBackend->HasError())
     {
     }
-
-    rawTextureData = ExtractSurfacePixels(textureSurface, g_TextureFormatBytesPerPixel[textureFormat]);
 
     this->textures[textureIdx].handle = this->currentTextureHandle;
     this->textures[textureIdx].textureData = rawTextureData;
@@ -491,18 +607,25 @@ ZunResult AnmManager::LoadTextureAlphaChannel(i32 textureIdx, const char *textur
     u32 y;
 
     textureDesc = this->textures + textureIdx;
+    // LoadTexture may lower the ANM-requested format to 16-bit according to
+    // the active configuration. Alpha decode and the replacement upload must
+    // use that effective format, not the original ANM field passed by caller.
+    const i32 effectiveTextureFormat = textureDesc->format;
 
-    if (textureDesc->format != TEX_FMT_A8R8G8B8 && textureDesc->format != TEX_FMT_A4R4G4B4 &&
-        textureDesc->format != TEX_FMT_A1R5G5B5)
+    if (effectiveTextureFormat != TEX_FMT_A8R8G8B8 && effectiveTextureFormat != TEX_FMT_A4R4G4B4 &&
+        effectiveTextureFormat != TEX_FMT_A1R5G5B5)
     {
         g_GameErrorContext.Fatal(TH_ERR_ANMMANAGER_UNK_TEX_FORMAT);
         return ZUN_ERROR;
     }
 
-    alphaSurface = LoadToSurfaceWithFormat(textureName, g_TextureFormatSDLMapping[textureFormat], NULL);
+    alphaSurface = LoadToSurfaceWithFormat(textureName, g_TextureFormatSDLMapping[effectiveTextureFormat], NULL,
+                                           textureDesc->width, textureDesc->height);
 
-    if (alphaSurface == NULL)
+    if (alphaSurface == NULL || alphaSurface->w != textureDesc->width ||
+        alphaSurface->h != textureDesc->height || textureDesc->textureData == NULL)
     {
+        SDL_FreeSurface(alphaSurface);
         return ZUN_ERROR;
     }
 
@@ -564,7 +687,7 @@ ZunResult AnmManager::LoadTextureAlphaChannel(i32 textureIdx, const char *textur
 
     this->SetCurrentTexture(this->textures[textureIdx].handle);
     g_GfxBackend->SetTextureImage(textureDesc->width, textureDesc->height, PIXEL_RGBA,
-                                  g_TextureFormatTypeMapping[textureFormat], textureDesc->textureData);
+                                  g_TextureFormatTypeMapping[effectiveTextureFormat], textureDesc->textureData);
 
     return ZUN_SUCCESS;
 }
@@ -711,7 +834,11 @@ void AnmManager::ReleaseTexture(i32 textureIdx)
     free((void *)this->textures[textureIdx].fileData);
     this->textures[textureIdx].fileData = NULL;
 
+#ifdef TH06_PSP
+    std::free(this->textures[textureIdx].textureData);
+#else
     delete[] this->textures[textureIdx].textureData;
+#endif
     this->textures[textureIdx].textureData = NULL;
 }
 

@@ -15,6 +15,9 @@
 #include "ZunMath.hpp"
 #include "i18n.hpp"
 #include "utils.hpp"
+#ifdef TH06_PSP
+#include "diag.hpp"
+#endif
 // #include <direct.h>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +27,17 @@
 static const f32 g_DifficultyWeightsList[5] = {-30.0f, -10.0f, 20.0f, 30.0f, 30.0f};
 
 static const u32 g_DefaultMagic = 'DMYS';
+
+// WriteScore emits fixed-count record families.  The original 640 KiB scratch
+// buffer is over fifty times larger than the maximum possible score.dat and
+// can fail on a fragmented PSP-1000 heap after a full run.
+static constexpr i32 kScoreDatFileBufferSize =
+    sizeof(ScoreRaw) + sizeof(Th6k) +
+    HSCR_NUM_DIFFICULTIES * HSCR_NUM_CHARS_SHOTTYPES * HSCR_NUM_SCORES_SLOTS * sizeof(Hscr) +
+    CLRD_NUM_CHARACTERS * sizeof(Clrd) + CATK_NUM_CAPTURES * sizeof(Catk) +
+    PSCR_NUM_DIFFICULTIES * PSCR_NUM_STAGES * PSCR_NUM_CHARS_SHOTTYPES * sizeof(Pscr);
+static_assert(kScoreDatFileBufferSize == 11744, "unexpected score.dat maximum size");
+static_assert(sizeof(ScoreRaw) == sizeof(Pscr), "score.dat header offset contract changed");
 
 // EoSD assumes every character in this array is a single byte, which is a safe assumption in SJIS, but not
 //   in UTF-8, so we have to encode '･' with an escape sequence
@@ -403,19 +417,42 @@ void ResultScreen::WriteScore(ResultScreen *resultScreen)
 
     sizeOfFile = 0;
 
-    fileBufferSize = SCORE_DAT_FILE_BUFFER_SIZE;
+    fileBufferSize = kScoreDatFileBufferSize;
+#ifdef TH06_PSP
+    th06_psp_boot_notef("SCORE SAVE BEGIN C%ldB", static_cast<long>(fileBufferSize));
+#endif
     fileBuffer = (u8 *)malloc(fileBufferSize);
+    if (fileBuffer == NULL)
+    {
+#ifdef TH06_PSP
+        th06_psp_boot_note("SCORE SAVE END R-4 B0");
+#endif
+        return;
+    }
 
-    std::memcpy(fileBuffer + sizeOfFile, resultScreen->scoreDat->rawScoreFile, sizeof(ScoreRaw));
+    const auto append = [&](const void *source, i32 bytesToAppend) {
+        if (source == NULL || bytesToAppend < 0 || bytesToAppend > fileBufferSize - sizeOfFile)
+            return false;
+        std::memcpy(fileBuffer + sizeOfFile, source, bytesToAppend);
+        sizeOfFile += bytesToAppend;
+        return true;
+    };
 
-    sizeOfFile += sizeof(ScoreRaw);
+    if (!append(resultScreen->scoreDat->rawScoreFile, sizeof(ScoreRaw)))
+    {
+        std::free(fileBuffer);
+        return;
+    }
     resultScreen->fileHeader.magic = TH6K_MAGIC;
     resultScreen->fileHeader.unkLen = sizeof(Th6k);
     resultScreen->fileHeader.th6kLen = sizeof(Th6k);
     resultScreen->fileHeader.version = TH6K_VERSION;
 
-    std::memcpy(fileBuffer + sizeOfFile, &resultScreen->fileHeader, sizeof(Th6k));
-    sizeOfFile += sizeof(Th6k);
+    if (!append(&resultScreen->fileHeader, sizeof(Th6k)))
+    {
+        std::free(fileBuffer);
+        return;
+    }
 
     for (difficulty = 0; difficulty < HSCR_NUM_DIFFICULTIES; difficulty++)
     {
@@ -437,8 +474,11 @@ void ResultScreen::WriteScore(ResultScreen *resultScreen)
                         currentCharacter->data->base.th6kLen = sizeof(Hscr);
                         currentCharacter->data->base.version = TH6K_VERSION;
                         currentCharacter->data->base.unk_9 = 0;
-                        std::memcpy(fileBuffer + sizeOfFile, currentCharacter->data, sizeof(Hscr));
-                        sizeOfFile += sizeof(Hscr);
+                        if (!append(currentCharacter->data, sizeof(Hscr)))
+                        {
+                            std::free(fileBuffer);
+                            return;
+                        }
                     }
                     currentCharacter = currentCharacter->next;
                     characterSlot++;
@@ -464,9 +504,11 @@ void ResultScreen::WriteScore(ResultScreen *resultScreen)
         clrd->base.unkLen = sizeof(Clrd);
         clrd->base.th6kLen = sizeof(Clrd);
         clrd->base.version = TH6K_VERSION;
-        std::memcpy(fileBuffer + sizeOfFile, clrd, sizeof(Clrd));
-
-        sizeOfFile += sizeof(Clrd);
+        if (!append(clrd, sizeof(Clrd)))
+        {
+            std::free(fileBuffer);
+            return;
+        }
     }
     catk = &g_GameManager.catk[0];
     for (difficulty = 0; difficulty < CATK_NUM_CAPTURES; difficulty++, catk++)
@@ -477,8 +519,11 @@ void ResultScreen::WriteScore(ResultScreen *resultScreen)
             catk->base.unkLen = sizeof(Catk);
             catk->base.th6kLen = sizeof(Catk);
             catk->base.version = TH6K_VERSION;
-            std::memcpy(fileBuffer + sizeOfFile, catk, sizeof(Catk));
-            sizeOfFile += sizeof(Catk);
+            if (!append(catk, sizeof(Catk)))
+            {
+                std::free(fileBuffer);
+                return;
+            }
         }
     }
     pscr = &g_GameManager.pscr[0][0][0];
@@ -490,8 +535,11 @@ void ResultScreen::WriteScore(ResultScreen *resultScreen)
             {
                 if (pscr->score != 0)
                 {
-                    std::memcpy(fileBuffer + sizeOfFile, pscr, sizeof(Pscr));
-                    sizeOfFile += sizeof(Pscr);
+                    if (!append(pscr, sizeof(Pscr)))
+                    {
+                        std::free(fileBuffer);
+                        return;
+                    }
                 }
             }
         }
@@ -527,7 +575,10 @@ void ResultScreen::WriteScore(ResultScreen *resultScreen)
         bytes++;
         remainingSize--;
     }
-    FileSystem::WriteDataToFile("score.dat", fileBuffer, sizeOfFile);
+    const int writeResult = FileSystem::WriteDataToFile("score.dat", fileBuffer, sizeOfFile);
+#ifdef TH06_PSP
+    th06_psp_boot_notef("SCORE SAVE END R%d B%ld", writeResult, static_cast<long>(sizeOfFile));
+#endif
     std::free(fileBuffer);
 }
 

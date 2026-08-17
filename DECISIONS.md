@@ -359,3 +359,84 @@ device全体の再帰検索は行わず、root自身とroot直下のfolderだけ
 起動時SELECTで検出済み候補と`AUTO`を選べる。明示選択だけを
 `TH06PSP_DATA_PATH.TXT`へ保存し、保存先が無効なら自動検索へ戻る。選択情報はuser dataであり、
 repositoryと配布ZIPには含めない。
+
+## D-032: replay面終端はengineで冪等化し、PSPは実使用範囲へ再び縮小する
+
+2026-08-16。D-025の面別`StageReplayData`縮小はPSP-1000の面間memoryに有効だったが、
+`SaveReplay()`内から同一翻訳単位の`StopRecording()`を呼ぶとlinker wrapperを通らず、
+縮小後のallocationへ二度目の終端recordを追記した。D-030はこれを避けるため縮小自体を
+停止したが、その間も完了面ごとの432,000 bytes予備領域は保存まで累積していた。
+
+`ReplayManager`は7面それぞれの終端済みstateを持ち、初回の`StopRecording()`だけが最終入力と
+sentinelを追記する。二度目以降はstage bufferの容量計算より前にreturnし、replay再生には
+終端を書かない。停止済み面への`OnUpdate()`追記も拒否する。次面の領域を正常に確保した時だけ、
+その面のstateとbookmarkを初期化する。
+
+PSP wrapperは終端済みstate、metadataと初期/最終/sentinelの最低3 record、bookmarkの
+`StageReplayData`範囲内性、現在cursorのbookmarkへの隣接を確認した後だけ`realloc`する。
+移動時は`stageReplayData`、`replayInputs`、`replayInputStageBookmarks`を全て更新し、縮小失敗時は
+元のallocationで続行する。この不変条件によりD-030の保持方針を置き換え、D-025のmemory回収を
+復活させる。replay入力、section形式、scoreは変えない。
+
+## D-033: PSPのPNG textureはANMの最終size/formatへscanline直decodeする
+
+2026-08-16。従来のPNG経路は原画像全体をRGBAへdecodeし、原sizeのformat変換surfaceと
+ANM指定sizeへのresize surfaceを別に確保した。さらに最終surfaceから`textureData`へ同じ
+pixelを再複製し、同期decode後も圧縮済みPBG entryをstage中保持していた。連続stageで断片化した
+PSP-1000 heapにとって、個々の最終texture sizeを超える同時確保が失敗点になる。
+
+PSPでtarget width/heightが分かるPNGは、libpngから1 scanlineずつRGBAを受け、従来と同じ
+nearest-neighbourのsource pixelだけを選んで最終SDL formatへ直接packする。RGBA32、ARGB8888、
+RGB24、RGB565、RGBA4444、RGBA5551に対応し、application側の大きpixel bufferは最終surface一枚と
+scanline一本に限定する。format変換とnearest-neighbourの採用順は交換できるため、選択される
+source pixelは変えない。
+
+PSPのANM textureはdecode後ただちに圧縮bufferを解放し、緊密配置のsurface pixel所有権を
+`textureData`へ移して最後のcopyも除く。alpha差替えは実際に採用されたtexture formatと最終sizeを
+使い、uploadも同じformatで行う。PSP以外のdecoder経路とANMの描画寸法は変えない。
+
+## D-034: PSP-1000の三面→四面失敗はeff04 PNG読込へ限定して扱う
+
+2026-08-16。PSP-1000実機は`STAGE END SIGNAL OLD3`後、四面ECL 60,796 bytesの
+`ECL ARENA LOAD B60796 N61`まで成功したが、`STAGE REINIT RESULT R-1 NOW4`で終了し、
+四面BGMはopenしなかった。同時刻のengine `log.txt`には
+`data/eff00/eff04.png`の読込失敗とEffectManager初期化失敗が記録された。
+
+これ以後、三面→四面問題をECL解放、四面script実行、BGM開始の未知停止とは扱わない。
+EffectManagerが`eff04.anm`から要求するPNGのdecode/format変換/resize時allocationと、その前に累積した
+replay面bufferを主対象とする。engineの「破損または欠落」messageはtexture生成失敗の汎用文言であり、
+原作assetの破損を確定する根拠にはしない。D-032/D-033後の四面EffectManager登録、四面BGM開始、
+それ以降のplayは実機未検証である。
+
+## D-035: 全面surfaceはtexture pool回収後も入らなければ256x512へ縮退する
+
+2026-08-16。D-032/D-033版をPSP-1000で通常playした結果、一面から六面までの全遷移は成功したが、
+六面game over後の名前入力で背景が白くなった。ResultScreen登録自体は`result.jpg`と
+`result00..03.anm`を全て読み`R0`で終了していた。その直後、512x512 RGB565 surface cacheの
+524,288 bytes確保だけが失敗し、同一OOMを365回、19.386秒にわたり毎frame記録していた。
+総heap空きは3,279KiB、top chunkは7KiBだった。第三値は最大free blockではなく
+`mallinfo.keepcost`であるが、512KiBの連続確保が失敗した事実は確定している。
+
+全面surface初回描画は、まずD-017の未使用texture poolからbest-fit blockを取得する。512KiBを
+直接満たせない時は、GEから既に退役済みのpool blockを全てnewlibへ返して隣接holeのcoalesceを促し、
+同じ512KiBを一度だけ再試行する。それでも失敗する時は256x512 RGB565へ縮退する。縦512行を維持するため、
+640x780 staff rollの442行とcrop/scroll契約は変えず、横解像度だけを落とす。cache entryは実使用bytesと
+元allocation bytesを分けて会計し、cache hit時も実storage寸法をtextureへ復元する。
+
+最終fallbackも確保できない時は、同じsurface serial/CRCについて再試行と同期FAT logを一回で止め、
+backingの無い全面quadだけを描かない。結果ANMと名前文字は黒背景上で操作可能なまま残す。この回復処理は
+ResultScreen専用ではなく共通surface pathに置くため、endingの複数背景差替えにも適用する。
+`result.jpg` decode前に512KiBを新規予約する方式は、実測で約900KiB増えたJPEG peakとheap arena上限を
+競合させるため採用しない。
+
+## D-036: score.dat書出しscratchは形式上の最大11,744 bytesに限定する
+
+2026-08-16。旧`ResultScreen::WriteScore()`は実際の出力長に関係なく640KiBをmallocし、NULL検査なしで
+直後に`memcpy`していた。名前入力時点で512KiB連続確保が失敗した実機状態では、結果画面を抜けた後の
+score保存も独立したfault候補になる。今回の唐突な終端はbattery切れと重なっており、このpathで落ちたとは
+断定しないが、未検査NULL書込みは残さない。
+
+最大出力は`ScoreRaw 20 + Th6k 12 + HSCR 5*4*10*28 + CLRD 4*24 + CATK 64*64 +
+PSCR 4*6*4*20 = 11,744 bytes`である。scratchをこの式へ縮め、六record family全てのappendを残容量検査し、
+malloc失敗時は既存scoreを上書きせず終了する。record順、各size、`fileLen`、checksum、XOR難読化、実書込長は
+変えない。PSP通常版は保存の一度だけ`SCORE SAVE BEGIN/END`へcapacity、write result、実bytesを残す。

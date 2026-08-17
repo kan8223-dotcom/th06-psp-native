@@ -761,3 +761,73 @@ NaNをGEへ渡さないため削除しない。
   1候補へ正規化した。
 - SELECT選択画面は通常EBOOTへ組み込み済みだが、PSP Go実機での操作と`ef0:`/`ms0:`双方の
   抜き差し・切替は未測定である。PPSSPP結果をPSP Go実機確認の代用にはしない。
+
+## V-031 PSP-1000三面→四面eff04失敗と恒久対策の未検証境界 (2026-08-16)
+
+- PSP-1000実機に配備されたEBOOTは3,066,342 bytes、SHA-256
+  `b461b9284e1d51718a8cd796661bbab4f100cbf2d48685dafe8a79cefcc89d70`。実機記録
+  `G:\TH06PSP_BOOT.LOG`はSHA-256
+  `d8acd08a87025047823cf87f7cb84222d479cafbe38999a05d807886226d07fe`で、一面→二面と二面→三面は
+  `STAGE REINIT RESULT R0 NOW2` / `R0 NOW3`で通過した。
+- 三面終了後は`ECL ARENA LOAD B60796 N61`まで進んだ後、
+  `STAGE REINIT RESULT R-1 NOW4`となった。同時刻の
+  `G:\PSP\GAME\TH06PSP\log.txt`は443 bytes、SHA-256
+  `c73fe8d9560b3faca4f81de29d34bdfcdbc1ddd517534ee52c2087dec91a9b5b`で、
+  `data/eff00/eff04.png`の読込失敗とEffectManager初期化失敗を記録した。四面BGM openは無く、
+  失敗はEffectManagerのeff04 texture読込までに限定できる。
+- この配備版はD-030の縮小停止版で、面間記録も`RC0KB`だった。従ってこの実機runは、
+  D-032の冪等終端＋replay compact復活を検証したものではない。またD-033の最終size/format直接PNG
+  decoderを実機で通した記録でもない。
+- D-032/D-033実装後の`ReplayManager.cpp`、`AnmManager.cpp`、`img_decode.cpp`、
+  `platform_hooks.cpp`はPSP GCCの`-fsyntax-only`を通過し、新規compile errorは無かった。
+  `RECORD_SOAK=1`のclean buildに成功し、その後に再び`make clean`した通常版buildも成功した。
+  通常版の`psp_preflight.sh --post`は違反0件/警告0件、`release_audit.sh`も合格した。
+  通常版は3,069,222 bytes、SHA-256
+  `8d88475f68fa917575f63650d61ca775a3b6f0a8eb037b5c74fa7c6a747883c0`。
+- PSP-1000のUSB書込みはdevice I/O errorで切断したためlive fileへ昇格せず、PSP-3000のD:へ
+  切り替えた。32KiB単位・250ms休止で`EBOOT.NEW`へstageし、書込み後とlive昇格後の二度の
+  全量SHA-256が上記hashと一致した。転送中のWindows disk event 51/153は0件で、stage fileも
+  残っていない。この確認は配備物の同一性だけを示し、PSP-1000上のruntime成功はまだ示さない。
+- 残るruntime検証は、PPSSPP `PSPModel=0`の通常録画で各面の
+  `RC` memory回収とcompact後のreplay保存/再読込を確認し、その同一hashをPSP-1000実機で
+  三面→四面EffectManager登録、`bgm/th06_08.wav`開始まで再試験する。六面終了後の保存は
+  V-029の二重終端回帰も兼ねる。PPSSPP実行と修正版の実機走行は、いずれも現時点で未実施である。
+
+## V-032 PSP-1000全六面遷移、Result surface OOM、終了保存対策 (2026-08-16)
+
+- D-032/D-033通常版をPSP-1000で通しplayした実機logは、一面→六面の全境界を成功した。
+  `NOW2..6`は全て`R0`、完了面replayは順に416/415/414/411/413KiB、最終面も421KiBを回収した。
+  これによりV-031で未実施だったeff04を含む三面→四面と、それ以降の通常面登録を実機確認済みに更新する。
+- 六面でContinue「No」を選んだ後、GameManager teardown、`result.jpg`、`result00..03.anm`は全て成功し、
+  `RESULT REGISTER END R0 H12680/3280KB`まで到達した。直後に
+  `GE SURFACE OOM 524288B T3488KB H12682/3279/7KB`が365回、19.386秒間反復した。
+  第三heap値7KiBは最大blockではなくtop chunkである。総空き3,279KiBでも512KiB連続確保が失敗し、
+  backing無しquadが白背景を描いたことが白い名前入力の直接原因である。
+- log末尾はOOM反復中に途切れ、`SCORE SAVE`、`REPLAY SAVE`、`ENGINE RETURN`、`HOME CB WAKE`、
+  `WATCHDOG TIMEOUT`は無い。起動時の`HOME CB READY/THREAD`は記録されている。user-mode版では
+  CPU例外handlerを利用できないため、例外の有無はこのlogだけでは判定できない。
+  battery切れは最後の唐突な終端と両立するが、その19秒以上前から始まった白画面は説明しない。
+  旧640KiB score scratchも終了時の独立riskだが、この実機runがそこへ到達した証拠は無い。
+- D-035/D-036後、PPSSPP v1.20.4の`PSPModel=0`で`RECORD_SOAK=1 RESULT_SOAK=1`を併用した。
+  一面から五面を300frameごとに通常replay Stop/compact付きで遷移し、`NOW2..6`は全て`R0 RC421KB`。
+  六面からResultへ移り、`RESULT REGISTER END R0`、初回背景
+  `GE SURFACE 640x480>480x272 P512KB`まで成功し、OOM/CXX OOM/watchdogは0件だった。
+- test-only input pulseで名前入力、stats、replay「No」を順に抜け、
+  `SCORE SAVE BEGIN C11744B`、`SCORE SAVE END R0 B4224`、
+  `REPLAY SAVE BEGIN (null)` / `REPLAY SAVE END`のfile非生成cleanupを確認した。
+  生成score.datは4,224 bytes、SHA-256
+  `42e2c3ae8c26135cbc567c757d7f05484b76bbf99730d9c7c6a0329df9899cda`。復号後checksumは
+  38,995/38,995、`fileLen`と実sizeは一致し、全record walkも境界内で終了した。
+  証拠logは`backups/PPSSPP_PSP1000_RECORD_RESULT_SURFACE_SAVE_20260816.LOG`、SHA-256
+  `f086b40edb39dcfbc85e480c58511f6daa53943b29dc45c1b63786b520933c18`。
+- test flagを除いてclean buildした通常EBOOTは3,070,758 bytes、SHA-256
+  `bf492542e1e335618276cdf15460f40cc4dd4571c186e37c92e1700a31cc3f44`。配布ZIPは
+  5,293,194 bytes、SHA-256
+  `ff20bfb318474057b350bcdc64f0ea5e210564ce8ac7620e188c2190838941c9`で、内包EBOOTも同一だった。
+  post-preflightは違反0件/警告0件、release auditと`git diff --check`は合格した。
+- PSP-1000の故障したUSB write pathは使わず、前回正常配備と同じPSP-3000のD:へ
+  通常EBOOTを配備した。旧liveをhostへ退避後、
+  32KiB単位・250ms休止で`EBOOT.NEW`へ書き、stageとlive昇格後を独立に全量読戻しした。
+  いずれも上記EBOOT hashと一致し、stage fileは残らず、転送開始後のWindows disk event 51/153/157は0件だった。
+  この確認は配備物の同一性だけを示し、PSP-1000上の結果画面成功はまだ示さない。
+- D-035/D-036通常版のPSP-1000実機結果画面、fallback 256x512、score保存はまだ未検証である。

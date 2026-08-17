@@ -1426,17 +1426,34 @@ extern "C" void th06_wrap_stop_replay()
             const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(stage);
             const std::uintptr_t end = reinterpret_cast<std::uintptr_t>(bookmark);
             const std::uintptr_t replayInput = reinterpret_cast<std::uintptr_t>(manager->replayInputs);
-            const std::size_t minimumBytes = offsetof(StageReplayData, replayInputs);
-            if (end >= begin + minimumBytes && end <= begin + sizeof(StageReplayData) &&
-                replayInput >= begin && replayInput < end)
+            const std::size_t minimumBytes =
+                offsetof(StageReplayData, replayInputs) + 3u * sizeof(ReplayDataInput);
+            if (manager->replayStageStopped[stageIndex] && end >= begin + minimumBytes &&
+                end <= begin + sizeof(StageReplayData) && replayInput >= begin && replayInput < end &&
+                end == replayInput + sizeof(ReplayDataInput))
             {
-                // SaveReplay() calls StopRecording() a second time after the
-                // player names the replay.  Calls within ReplayManager.cpp
-                // bypass the linker wrapper, so a previously realloc-shrunk
-                // record would receive that second terminator past its true
-                // allocation.  Retain the original allocation until the
-                // save completes; the final cleanup then releases it.
-                gReplayStoppedStages[stageIndex] = stage;
+                const std::size_t usedBytes = static_cast<std::size_t>(end - begin);
+                const std::size_t replayInputOffset = static_cast<std::size_t>(replayInput - begin);
+                if (usedBytes < sizeof(StageReplayData))
+                {
+                    void *shrunk = std::realloc(stage, usedBytes);
+                    if (shrunk != nullptr)
+                    {
+                        auto *relocated = static_cast<StageReplayData *>(shrunk);
+                        manager->replayData->stageReplayData[stageIndex] = relocated;
+                        manager->replayInputs = reinterpret_cast<ReplayDataInput *>(
+                            reinterpret_cast<unsigned char *>(relocated) + replayInputOffset);
+                        manager->replayInputStageBookmarks[stageIndex] = reinterpret_cast<ReplayDataInput *>(
+                            reinterpret_cast<unsigned char *>(relocated) + usedBytes);
+                        gReplayCompactedBytes = sizeof(StageReplayData) - usedBytes;
+                    }
+                }
+
+                // StopRecording itself now rejects the later SaveReplay call,
+                // including calls made inside the same translation unit that
+                // bypass this linker wrapper. Remember the relocated pointer
+                // as an additional guard for external calls.
+                gReplayStoppedStages[stageIndex] = manager->replayData->stageReplayData[stageIndex];
             }
         }
     }
@@ -1644,7 +1661,37 @@ extern "C" unsigned short th06_wrap_controller_get_input() asm("__wrap__ZN10Cont
 extern "C" unsigned short th06_wrap_controller_get_input()
 {
     SDL_GetKeyboardState(nullptr);
-    return th06_real_controller_get_input();
+    unsigned short input = th06_real_controller_get_input();
+#if defined(TH06_PSP_RESULT_SOAK)
+    // Complete the result lifecycle as well as its registration: leave the
+    // name keyboard, acknowledge stats, then decline replay saving.  Each
+    // pulse is one frame so the ordinary WAS_PRESSED edges are exercised.
+    static unsigned int resultSoakFrames;
+    if (g_Supervisor.curState == SUPERVISOR_STATE_RESULTSCREEN_FROMGAME)
+    {
+        ++resultSoakFrames;
+        if (resultSoakFrames == 120)
+        {
+            input |= TH_BUTTON_MENU;
+            th06_psp_boot_note("RESULT SOAK INPUT NAME END");
+        }
+        else if (resultSoakFrames == 240)
+        {
+            input |= TH_BUTTON_SELECTMENU;
+            th06_psp_boot_note("RESULT SOAK INPUT STATS END");
+        }
+        else if (resultSoakFrames == 360)
+        {
+            input |= TH_BUTTON_MENU;
+            th06_psp_boot_note("RESULT SOAK INPUT REPLAY NO");
+        }
+    }
+    else
+    {
+        resultSoakFrames = 0;
+    }
+#endif
+    return input;
 }
 
 // The development build deliberately has no PSP MIDI synthesizer or external
@@ -1778,9 +1825,10 @@ extern "C" unsigned int th06_psp_player_update(Player *player)
     }
 #if defined(TH06_PSP_RECORD_SOAK)
     // Exercise the normal recording/compaction path without making the test
-    // wait for three complete stage scripts. GameManager::RegisterChain does
+    // wait for five complete stage scripts. GameManager::RegisterChain does
     // the ordinary stage increment; only the test transition trigger is fake.
-    if (g_ReplayManager != nullptr && g_GameManager.currentStage <= 3 && soakStageFrames >= 300 &&
+    // Stop at stage 6 so the harness covers every normal-play stage boundary.
+    if (g_ReplayManager != nullptr && g_GameManager.currentStage <= 5 && soakStageFrames >= 300 &&
         g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER)
     {
         th06_psp_boot_notef("RECORD SOAK FORCE END S%ld", g_GameManager.currentStage);

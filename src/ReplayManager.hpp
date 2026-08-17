@@ -20,6 +20,9 @@ struct ReplayManager
     static ZunResult ValidateReplayData(const ReplayHeader *data, i32 fileSize);
 
     ReplayManager()
+        : frameId(0), replayData(nullptr), isDemo(0), replayFile(nullptr), unk10{}, unk44(0), replayInputs(nullptr),
+          replayInputStageBookmarks{}, calcChain(nullptr), drawChain(nullptr), calcChainDemoHighPrio(nullptr),
+          replayStageStopped{}
     {
     }
 
@@ -39,4 +42,9 @@ struct ReplayManager
     ChainElem *calcChain;
     ChainElem *drawChain;
     ChainElem *calcChainDemoHighPrio;
+
+    // StopRecording is reached once at a stage boundary and again from
+    // SaveReplay. Keep the state on the manager rather than inferring it from
+    // the allocation size so PSP may safely shrink completed stage buffers.
+    u8 replayStageStopped[7];
 };

@@ -37,6 +37,7 @@ constexpr unsigned int kDepthBytes = kBufferWidth * kScreenHeight * 2;
 constexpr unsigned int kEdramUsedBytes = kDepthOffset + kDepthBytes;
 constexpr int kMaxTextures = 512;
 constexpr int kSurfaceCacheEntries = 2;
+constexpr unsigned int kSurfaceFallbackWidth = 256;
 constexpr unsigned int kMaxVertexPayloadBytes = 512 * 1024;
 constexpr unsigned int kListBytes = (256 + 512) * 1024;
 constexpr unsigned int kListSoftLimit = kListBytes - 16 * 1024;
@@ -136,6 +137,7 @@ struct SurfaceCacheEntry
     unsigned int storageWidth;
     unsigned int storageHeight;
     unsigned int bytes;
+    unsigned int allocationBytes;
     unsigned long crc;
     unsigned int surfaceSerial;
     unsigned int lastUse;
@@ -244,7 +246,8 @@ class PspGuGfx final : public GfxInterface
           mDepthFunc(DEPTH_FUNC_LEQUAL), mDepthWrite(true), mDepthTest(false), mTextureFactor(0xffffffffu),
           mColorOp(COLOR_OP_MODULATE), mClearDepth(1.0f), mClearColor(0xff000000u), mFogNear(1000.0f),
           mFogFar(5000.0f), mFogColor(0xffa0a0a0u), mFrames(0), mFirstFrameUs(0), mDraws(0), mVertices(0),
-          mTextureBytes(0), mEdramSize(0), mMaxListBytes(0), mListsThisFrame(0), mSurfaceCacheClock(0), mTracedCreate(false),
+          mTextureBytes(0), mEdramSize(0), mMaxListBytes(0), mListsThisFrame(0), mSurfaceCacheClock(0),
+          mSurfaceOomReported(false), mSurfaceOomSerial(0), mSurfaceOomCrc(0), mTracedCreate(false),
           mTracedDummyImage(false), mTracedViewport(false), mTracedClear(false), mRuntimeTextureTraces(0),
           mRuntimeUploadTraces(0), mFrameStartUs(0), mPerfWindowStartUs(0), mPerfCpuUs(0), mPerfGeUs(0),
           mPerfVblankUs(0), mPerfStartDraws(0), mPerfStartVertices(0), mPerfFrames(0),
@@ -948,8 +951,8 @@ class PspGuGfx final : public GfxInterface
                 continue;
             if (entry.surfaceSerial != 0)
                 th06_psp_mark_surface_ge_cached(entry.surfaceSerial, 0);
-            freed += entry.bytes;
-            mTextureBytes -= entry.bytes;
+            freed += entry.allocationBytes;
+            mTextureBytes -= entry.allocationBytes;
             std::free(entry.pixels);
             entry = SurfaceCacheEntry{};
         }
@@ -970,6 +973,14 @@ class PspGuGfx final : public GfxInterface
         // smallest native layout before reserving the live vertex arena.
         const bool textured = mUseTexCoord && mAttributePointers[VERTEX_ARRAY_TEX_COORD];
         const bool colored = mUseDiffuse && mAttributePointers[VERTEX_ARRAY_DIFFUSE];
+        // An optional full-screen still can exhaust even the reduced cache on
+        // a severely fragmented PSP-1000 heap.  Drawing its textured quad with
+        // no backing pixels disables texturing and produces an opaque white
+        // rectangle over otherwise usable result UI.  Drop only that missing
+        // textured draw; later ANM/text draws with valid handles still run.
+        if (textured && mBoundTexture != 0 && mBoundTexture < kMaxTextures &&
+            mTextures[mBoundTexture].surfaceCandidate && !mTextures[mBoundTexture].pixels)
+            return;
 
         // AnmManager's buffered path emits every axis-aligned sprite as six
         // triangle vertices in VertexTex1Xyzrhw layout.  GE's native sprite
@@ -1464,6 +1475,9 @@ class PspGuGfx final : public GfxInterface
     unsigned int mListsThisFrame;
     SurfaceCacheEntry mSurfaceCache[kSurfaceCacheEntries];
     unsigned int mSurfaceCacheClock;
+    bool mSurfaceOomReported;
+    unsigned int mSurfaceOomSerial;
+    unsigned long mSurfaceOomCrc;
     bool mTracedCreate;
     bool mTracedDummyImage;
     bool mTracedViewport;
@@ -1608,6 +1622,22 @@ class PspGuGfx final : public GfxInterface
         texture.allocationBytes = 0;
     }
 
+    unsigned int ReleaseFreeTextureBlocks()
+    {
+        unsigned int freed = 0;
+        for (int i = 0; i < kMaxTextures; ++i)
+        {
+            FreeTextureBlock &block = mFreeTextureBlocks[i];
+            if (!block.pixels)
+                continue;
+            freed += block.bytes;
+            mTextureBytes -= block.bytes;
+            std::free(block.pixels);
+            block = FreeTextureBlock{};
+        }
+        return freed;
+    }
+
     void *AcquireTexturePixels(unsigned int bytes, unsigned int *allocationBytes)
     {
         int best = -1;
@@ -1713,6 +1743,8 @@ class PspGuGfx final : public GfxInterface
             const unsigned int sourceBytes = static_cast<unsigned int>(contentWidth * contentHeight * 3);
             crc = crc32(crc32(0L, Z_NULL, 0), source, sourceBytes);
         }
+        if (mSurfaceOomReported && mSurfaceOomSerial == surfaceSerial && mSurfaceOomCrc == crc)
+            return;
 
         SurfaceCacheEntry *entry = nullptr;
         for (int i = 0; i < kSurfaceCacheEntries; ++i)
@@ -1752,28 +1784,65 @@ class PspGuGfx final : public GfxInterface
                     th06_psp_mark_surface_ge_cached(entry->surfaceSerial, 0);
             }
 
-            if (!entry->pixels || entry->bytes != texture.bytes)
+            const unsigned int requestedBytes = texture.bytes;
+            unsigned int poolFreed = 0;
+            if (!entry->pixels || entry->allocationBytes < texture.bytes)
             {
                 if (entry->pixels)
                 {
-                    mTextureBytes -= entry->bytes;
+                    mTextureBytes -= entry->allocationBytes;
                     std::free(entry->pixels);
+                    entry->pixels = nullptr;
+                    entry->bytes = 0;
+                    entry->allocationBytes = 0;
                 }
-                entry->pixels = memalign(16, texture.bytes);
+
+                unsigned int allocationBytes = 0;
+                entry->pixels = AcquireTexturePixels(texture.bytes, &allocationBytes);
+                if (!entry->pixels)
+                {
+                    // Stage-local textures are deliberately retained in a
+                    // best-fit pool to avoid fragmentation between stages.
+                    // Once a full-screen still cannot fit, those blocks are
+                    // more useful returned to newlib so adjacent holes can
+                    // coalesce into the one 512 KiB surface allocation.
+                    poolFreed = ReleaseFreeTextureBlocks();
+                    if (poolFreed != 0)
+                        entry->pixels = AcquireTexturePixels(texture.bytes, &allocationBytes);
+                }
+                if (!entry->pixels && texture.storageWidth > kSurfaceFallbackWidth)
+                {
+                    // A 256x512 RGB565 cache retains all 442 possible staff-
+                    // roll rows and only reduces horizontal resolution.  It
+                    // is a safe last resort on a heavily fragmented PSP-1000
+                    // heap and is preferable to an opaque unbacked quad.
+                    texture.storageWidth = kSurfaceFallbackWidth;
+                    texture.bytes = texture.storageWidth * texture.storageHeight * BytesPerPixel(texture.psm);
+                    texture.swizzled = texture.storageWidth * BytesPerPixel(texture.psm) >= 16u &&
+                                       texture.storageHeight >= 8u;
+                    entry->pixels = AcquireTexturePixels(texture.bytes, &allocationBytes);
+                }
                 if (!entry->pixels)
                 {
                     entry->bytes = 0;
+                    entry->allocationBytes = 0;
                     entry->valid = false;
-                    mError = true;
+                    mSurfaceOomReported = true;
+                    mSurfaceOomSerial = surfaceSerial;
+                    mSurfaceOomCrc = crc;
                     const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
-                    th06_psp_boot_notef("GE SURFACE OOM %uB T%uKB H%u/%u/%uKB", texture.bytes,
+                    th06_psp_boot_notef("GE SURFACE OOM %uB F%uB X%uKB T%uKB H%u/%u/%uKB",
+                                        requestedBytes, texture.bytes, poolFreed / 1024u,
                                         mTextureBytes / 1024u, heap.usedBytes / 1024u,
                                         heap.freeBytes / 1024u, heap.topFreeBytes / 1024u);
                     return;
                 }
-                entry->bytes = texture.bytes;
-                mTextureBytes += entry->bytes;
+                entry->allocationBytes = allocationBytes;
             }
+            entry->bytes = texture.bytes;
+            mSurfaceOomReported = false;
+            if (poolFreed != 0)
+                th06_psp_boot_notef("GE SURFACE POOL X%uKB", poolFreed / 1024u);
 
             entry->logicalWidth = texture.width;
             entry->logicalHeight = texture.height;
@@ -1856,6 +1925,8 @@ class PspGuGfx final : public GfxInterface
 
         entry->lastUse = ++mSurfaceCacheClock;
         texture.pixels = entry->pixels;
+        texture.storageWidth = entry->storageWidth;
+        texture.storageHeight = entry->storageHeight;
         texture.bytes = entry->bytes;
         texture.allocationBytes = 0;
         texture.psm = entry->psm;

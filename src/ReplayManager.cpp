@@ -143,6 +143,14 @@ ChainCallbackResult ReplayManager::OnUpdate(ReplayManager *mgr)
     {
         return CHAIN_CALLBACK_RESULT_CONTINUE;
     }
+    const i32 activeStageIdx = g_GameManager.currentStage - 1;
+    if (mgr->replayData == NULL || activeStageIdx < 0 ||
+        activeStageIdx >= ARRAY_SIZE_SIGNED(mgr->replayData->stageReplayData) ||
+        mgr->replayData->stageReplayData[activeStageIdx] == NULL || mgr->replayInputs == NULL ||
+        mgr->replayStageStopped[activeStageIdx])
+    {
+        return CHAIN_CALLBACK_RESULT_CONTINUE;
+    }
     inputs = IS_PRESSED(TH_BUTTON_REPLAY_CAPTURE);
     if (inputs != mgr->replayInputs->inputKey)
     {
@@ -152,7 +160,7 @@ ChainCallbackResult ReplayManager::OnUpdate(ReplayManager *mgr)
             StageReplayData *stage = mgr->replayData->stageReplayData[stageIdx];
             ReplayDataInput *end = stage ? stage->replayInputs + ARRAY_SIZE(stage->replayInputs) : NULL;
             // Reserve two records for StopRecording's final state and sentinel.
-            if (stage != NULL && mgr->replayInputs < end - 3)
+            if (stage != NULL && mgr->replayInputs >= stage->replayInputs && mgr->replayInputs < end - 3)
             {
                 mgr->replayInputs += 1;
                 mgr->replayInputStageBookmarks[stageIdx] = mgr->replayInputs + 1;
@@ -268,8 +276,15 @@ ZunResult ReplayManager::AddedCallback(ReplayManager *mgr)
     {
         utils::DebugPrint2("error : replay.cpp");
     }
-    mgr->replayData->stageReplayData[g_GameManager.currentStage - 1] = AllocateStageReplayData(sizeof(StageReplayData));
-    stageReplayData = mgr->replayData->stageReplayData[g_GameManager.currentStage - 1];
+    const i32 stageIdx = g_GameManager.currentStage - 1;
+    mgr->replayData->stageReplayData[stageIdx] = AllocateStageReplayData(sizeof(StageReplayData));
+    stageReplayData = mgr->replayData->stageReplayData[stageIdx];
+    if (stageReplayData == NULL)
+    {
+        return ZUN_ERROR;
+    }
+    mgr->replayInputStageBookmarks[stageIdx] = NULL;
+    mgr->replayStageStopped[stageIdx] = 0;
     stageReplayData->bombsRemaining = g_GameManager.bombsRemaining;
     stageReplayData->livesRemaining = g_GameManager.livesRemaining;
     stageReplayData->power = g_GameManager.currentPower;
@@ -371,10 +386,16 @@ ZunResult ReplayManager::DeletedCallback(ReplayManager *mgr)
 void ReplayManager::StopRecording()
 {
     ReplayManager *mgr = g_ReplayManager;
-    if (mgr != NULL && mgr->replayData != NULL)
+    if (mgr != NULL && !mgr->IsDemo() && mgr->replayData != NULL)
     {
         i32 stageIdx = g_GameManager.currentStage - 1;
         if (stageIdx < 0 || stageIdx >= ARRAY_SIZE_SIGNED(mgr->replayData->stageReplayData))
+            return;
+        // GameManager finalizes the stage before the next registration, while
+        // SaveReplay finalizes it again before serializing. The second call
+        // must be a no-op: on PSP the first call may already have realloc-
+        // shrunk the buffer to the bookmark.
+        if (mgr->replayStageStopped[stageIdx])
             return;
         StageReplayData *stage = mgr->replayData->stageReplayData[stageIdx];
         ReplayDataInput *end = stage ? stage->replayInputs + ARRAY_SIZE(stage->replayInputs) : NULL;
@@ -388,6 +409,7 @@ void ReplayManager::StopRecording()
         mgr->replayInputs->frameNum = 9999999;
         mgr->replayInputs->inputKey = 0;
         mgr->replayInputStageBookmarks[stageIdx] = mgr->replayInputs + 1;
+        mgr->replayStageStopped[stageIdx] = 1;
     }
 }
 

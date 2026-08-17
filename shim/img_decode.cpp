@@ -4,6 +4,7 @@
 #include <SDL2/SDL_shim.h>
 
 #include <csetjmp>
+#include <cstdint>
 #include <jpeglib.h>
 #include <png.h>
 
@@ -31,6 +32,169 @@ static void PngReadFn(png_structp png, png_bytep out, png_size_t len)
     }
     memcpy(out, src->data + src->pos, len);
     src->pos += len;
+}
+
+// Packed 16-bit texels use the same native-u16 convention as the renderer.
+static Uint16 PackPixel16(Uint32 fmt, Uint8 r, Uint8 g, Uint8 b, Uint8 a)
+{
+    switch (fmt)
+    {
+    case SDL_PIXELFORMAT_RGB565:
+        return (Uint16)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+    case SDL_PIXELFORMAT_RGBA4444:
+        return (Uint16)(((r >> 4) << 12) | ((g >> 4) << 8) | ((b >> 4) << 4) | (a >> 4));
+    case SDL_PIXELFORMAT_RGBA5551:
+        return (Uint16)(((r >> 3) << 11) | ((g >> 3) << 6) | ((b >> 3) << 1) | (a >> 7));
+    default:
+        return 0;
+    }
+}
+
+static bool StoreRgbaPixel(Uint8 *dst, Uint32 fmt, Uint8 r, Uint8 g, Uint8 b, Uint8 a)
+{
+    switch (fmt)
+    {
+    case SDL_PIXELFORMAT_RGBA32:
+        dst[0] = r;
+        dst[1] = g;
+        dst[2] = b;
+        dst[3] = a;
+        return true;
+    case SDL_PIXELFORMAT_ARGB8888:
+        dst[0] = a;
+        dst[1] = r;
+        dst[2] = g;
+        dst[3] = b;
+        return true;
+    case SDL_PIXELFORMAT_RGB24:
+        dst[0] = r;
+        dst[1] = g;
+        dst[2] = b;
+        return true;
+    case SDL_PIXELFORMAT_RGB565:
+    case SDL_PIXELFORMAT_RGBA4444:
+    case SDL_PIXELFORMAT_RGBA5551:
+        *reinterpret_cast<Uint16 *>(dst) = PackPixel16(fmt, r, g, b, a);
+        return true;
+    default:
+        return false;
+    }
+}
+
+// PSP texture PNGs can be larger than the ANM texture they feed. The generic
+// path decodes a full RGBA image, converts another full source-size image, and
+// only then downsizes it. Decode one RGBA row at a time and write the sampled
+// pixels directly in the final size/format instead. This produces the same
+// nearest-neighbour pixels with only one output surface plus a scanline.
+extern "C" SDL_Surface *th06_psp_img_load_png_scaled_format(const Uint8 *data, size_t size, Uint32 format,
+                                                             int targetWidth, int targetHeight)
+{
+    if (!data || size < 8 || png_sig_cmp((png_bytep)data, 0, 8) != 0 || targetWidth <= 0 || targetHeight <= 0)
+        return nullptr;
+    if (format != SDL_PIXELFORMAT_RGBA32 && format != SDL_PIXELFORMAT_ARGB8888 &&
+        format != SDL_PIXELFORMAT_RGB24 && format != SDL_PIXELFORMAT_RGB565 &&
+        format != SDL_PIXELFORMAT_RGBA4444 && format != SDL_PIXELFORMAT_RGBA5551)
+        return nullptr;
+
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png)
+        return nullptr;
+    png_infop info = png_create_info_struct(png);
+    if (!info)
+    {
+        png_destroy_read_struct(&png, NULL, NULL);
+        return nullptr;
+    }
+
+    SDL_Surface *surface = nullptr;
+    Uint8 *row = nullptr;
+    // libpng reports decode errors with longjmp. Keep volatile cleanup copies:
+    // ordinary automatic variables modified after setjmp have indeterminate
+    // values when control returns through that jump.
+    SDL_Surface *volatile surfaceToFree = nullptr;
+    Uint8 *volatile rowToFree = nullptr;
+    if (setjmp(png_jmpbuf(png)))
+    {
+        png_destroy_read_struct(&png, &info, NULL);
+        free(rowToFree);
+        SDL_FreeSurface(surfaceToFree);
+        return nullptr;
+    }
+
+    PngMemSrc src = {data, size, 0};
+    png_set_read_fn(png, &src, PngReadFn);
+    png_read_info(png, info);
+
+    const png_uint_32 sourceWidth = png_get_image_width(png, info);
+    const png_uint_32 sourceHeight = png_get_image_height(png, info);
+    const int bitDepth = png_get_bit_depth(png, info);
+    const int colorType = png_get_color_type(png, info);
+    if (sourceWidth == 0 || sourceHeight == 0 || png_get_interlace_type(png, info) != PNG_INTERLACE_NONE)
+    {
+        png_destroy_read_struct(&png, &info, NULL);
+        return nullptr;
+    }
+
+    if (colorType == PNG_COLOR_TYPE_PALETTE)
+        png_set_palette_to_rgb(png);
+    if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
+        png_set_expand_gray_1_2_4_to_8(png);
+    if (png_get_valid(png, info, PNG_INFO_tRNS))
+        png_set_tRNS_to_alpha(png);
+    if (bitDepth == 16)
+        png_set_strip_16(png);
+    if (colorType == PNG_COLOR_TYPE_GRAY || colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
+        png_set_gray_to_rgb(png);
+    png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    png_read_update_info(png, info);
+
+    const png_size_t rowBytes = png_get_rowbytes(png, info);
+    if (rowBytes < static_cast<png_size_t>(sourceWidth) * 4u)
+    {
+        png_destroy_read_struct(&png, &info, NULL);
+        return nullptr;
+    }
+
+    surface = SDL_CreateRGBSurfaceWithFormat(0, targetWidth, targetHeight, SDL_BITSPERPIXEL(format), format);
+    surfaceToFree = surface;
+    row = static_cast<Uint8 *>(malloc(rowBytes));
+    rowToFree = row;
+    if (!surface || !row)
+    {
+        png_destroy_read_struct(&png, &info, NULL);
+        free(row);
+        SDL_FreeSurface(surface);
+        return nullptr;
+    }
+
+    int dstY = 0;
+    const int dstBytesPerPixel = surface->format->BytesPerPixel;
+    for (png_uint_32 srcY = 0; srcY < sourceHeight; ++srcY)
+    {
+        png_read_row(png, row, NULL);
+        while (dstY < targetHeight &&
+               (static_cast<uint64_t>(dstY) * sourceHeight) / static_cast<unsigned int>(targetHeight) == srcY)
+        {
+            Uint8 *dstRow = static_cast<Uint8 *>(surface->pixels) + dstY * surface->pitch;
+            for (int dstX = 0; dstX < targetWidth; ++dstX)
+            {
+                const png_uint_32 srcX = static_cast<png_uint_32>(
+                    (static_cast<uint64_t>(dstX) * sourceWidth) / static_cast<unsigned int>(targetWidth));
+                const Uint8 *srcPixel = row + static_cast<size_t>(srcX) * 4u;
+                if (!StoreRgbaPixel(dstRow + dstX * dstBytesPerPixel, format, srcPixel[0], srcPixel[1], srcPixel[2],
+                                    srcPixel[3]))
+                    png_error(png, "unsupported target format");
+            }
+            ++dstY;
+        }
+    }
+
+    if (dstY != targetHeight)
+        png_error(png, "scaled PNG row count mismatch");
+    png_read_end(png, NULL);
+    png_destroy_read_struct(&png, &info, NULL);
+    free(row);
+    return surface;
 }
 
 static SDL_Surface *LoadPngFromMem(const Uint8 *data, size_t size)
@@ -249,22 +413,6 @@ SDL_Surface *IMG_Load_RW(SDL_RWops *src, int freesrc)
 }
 
 // ---------------------------------------------------------------- format conversion
-// Packed 16-bit texels are stored as native (BE) u16 - our renderer defines the convention.
-static Uint16 PackPixel16(Uint32 fmt, Uint8 r, Uint8 g, Uint8 b, Uint8 a)
-{
-    switch (fmt)
-    {
-    case SDL_PIXELFORMAT_RGB565:
-        return (Uint16)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-    case SDL_PIXELFORMAT_RGBA4444:
-        return (Uint16)(((r >> 4) << 12) | ((g >> 4) << 8) | ((b >> 4) << 4) | (a >> 4));
-    case SDL_PIXELFORMAT_RGBA5551:
-        return (Uint16)(((r >> 3) << 11) | ((g >> 3) << 6) | ((b >> 3) << 1) | (a >> 7));
-    default:
-        return 0;
-    }
-}
-
 SDL_Surface *SDL_ConvertSurfaceFormat(SDL_Surface *src, Uint32 fmt, Uint32)
 {
     if (!src)
