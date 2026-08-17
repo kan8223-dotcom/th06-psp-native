@@ -1,7 +1,7 @@
 #!/bin/bash
 # psp_go — 検査→ビルド→検査→一発デプロイ
-# デプロイはPowerShell UNC方式 (根拠: PSPPMDVIS大百科「/mnt/e /mnt/g直接参照全面禁止 前科12回」、
-# pmd_psp/deploy.sh 実績パターン)。
+# デプロイはWindows PowerShellから32KiB単位で低速stage/verifyする。
+# /mnt/e /mnt/gを直接書かず、切断時もlive EBOOTへstreamしない。
 #
 # 使い方: ./psp_go.sh --drive H          … Windowsで確認したPSPへ配達
 #         ./psp_go.sh --drive H --clean  … clean buildしてから配達
@@ -76,10 +76,11 @@ TS=$(date +%Y%m%d_%H%M%S)
 cp EBOOT.PBP "backups/EBOOT_${TS}.PBP"
 ls -t backups/EBOOT_*.PBP 2>/dev/null | tail -n +$((BACKUP_KEEP+1)) | xargs -r rm -f
 
-# WSL→UNCパス変換 (直接 /mnt/e 参照は禁止 [大 前科12回])
-WSL_DISTRO="${WSL_DISTRO_NAME:-Ubuntu-24.04}"
-EBOOT_UNC="\\\\wsl.localhost\\${WSL_DISTRO}${SCRIPT_DIR}/EBOOT.PBP"
-DRIVE_LIST=$(printf "'%s'," "${DRIVES[@]}" | sed "s/,$//")
+# PowerShell側はWindowsネイティブパスだけを使う。WSL共有UNC経由だと
+# PSPからのロールバック退避にAccess Deniedが起きえる。
+EBOOT_WIN=$(wslpath -w "${SCRIPT_DIR}/EBOOT.PBP")
+BACKUP_WIN=$(wslpath -w "${SCRIPT_DIR}/backups")
+DEPLOY_SCRIPT_WIN=$(wslpath -w "${SCRIPT_DIR}/tools/psp_throttled_deploy.ps1")
 
 # 配達物の同一性は「コピーした」ではなく実機側のハッシュで示す。
 # 前科: 型エラーで新EBOOTが生成されていないのに古い版を配達した (2026-08-04)。
@@ -87,42 +88,11 @@ LOCAL_SHA=$(sha256sum EBOOT.PBP | cut -d' ' -f1 | tr 'a-f' 'A-F')
 LOCAL_SIZE=$(stat -c %s EBOOT.PBP)
 echo "  ローカル EBOOT.PBP: ${LOCAL_SIZE} bytes / SHA256 ${LOCAL_SHA}"
 
-/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe -Command "
-\$src = '${EBOOT_UNC}'
-\$expect = '${LOCAL_SHA}'
-\$ok = 0
-foreach (\$d in @(${DRIVE_LIST})) {
-    for (\$i=0; \$i -lt 5; \$i++) {
-        if (Test-Path \"\$(\$d):\\\") { break }
-        Start-Sleep -Seconds 1
-    }
-    if (Test-Path \"\$(\$d):\\\") {
-        \$vol = Get-Volume -DriveLetter \$d -ErrorAction Stop
-        if (\$vol.FileSystem -notin @('FAT', 'FAT32')) {
-            Write-Host \"Deploy REFUSED: \$(\$d): filesystem is \$(\$vol.FileSystem), not PSP FAT/FAT32\"
-            continue
-        }
-        if (!(Test-Path \"\$(\$d):\\PSP\")) {
-            Write-Host \"Deploy REFUSED: \$(\$d): has no existing PSP directory\"
-            continue
-        }
-        \$dir = \"\$(\$d):\\PSP\\GAME\\${GAME_NAME}\"
-        if (!(Test-Path \$dir)) { New-Item -ItemType Directory -Path \$dir -Force | Out-Null }
-        \$dst = \"\$dir\\EBOOT.PBP\"
-        Copy-Item \$src \$dst -Force
-        \$got = (Get-FileHash -LiteralPath \$dst -Algorithm SHA256).Hash
-        if (\$got -ne \$expect) {
-            Write-Host \"Deploy HASH MISMATCH: \$(\$d): got \$got\"
-            continue
-        }
-        Write-Host \"Deploy OK: \$(\$d): -> PSP\GAME\${GAME_NAME}  SHA256 \$got\"
-        \$ok++
-    } else {
-        Write-Host \"Drive \$(\$d): not found (USB接続確認)\"
-    }
-}
-if (\$ok -eq 0) { exit 1 }
-" || { echo "[FAIL] デプロイ失敗: ドライブ未接続、またはハッシュ不一致"; exit 1; }
+/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe \
+  -NoProfile -ExecutionPolicy Bypass -File "${DEPLOY_SCRIPT_WIN}" \
+  -DriveLetter "${DRIVE}" -Source "${EBOOT_WIN}" -BackupDirectory "${BACKUP_WIN}" \
+  -GameName "${GAME_NAME}" -ChunkKiB 32 -DelayMs 250 \
+  || { echo "[FAIL] 低速stage配備失敗: live EBOOTはhost rollbackか旧版のまま"; exit 1; }
 
 echo ""
 echo "=== 完了。PSPで PSP/GAME/${GAME_NAME} を起動しろ。 ==="
