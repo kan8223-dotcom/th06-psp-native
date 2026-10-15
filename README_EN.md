@@ -95,6 +95,7 @@ The resulting layout should look like this:
 PSP/GAME/TH06PSP/
 ├── EBOOT.PBP
 ├── NotoSansJP-Regular.ttf
+├── msgothic.ttc                 <- optional MS Gothic; supply your own (not included)
 ├── README.md
 ├── README_EN.md
 ├── CREDITS.md
@@ -113,6 +114,11 @@ PSP/GAME/TH06PSP/
         ├── th06_01.wav
         └── ... th06_17.wav
 ```
+
+To use MS Gothic, optionally copy `C:\Windows\Fonts\msgothic.ttc` from your own Windows installation to
+`PSP/GAME/TH06PSP/msgothic.ttc`, beside `EBOOT.PBP`. MS Gothic is tried first; if it is missing or cannot be
+loaded, the included `NotoSansJP-Regular.ttf` is used instead. This Microsoft font is not included; do not
+upload it to GitHub or attach it to issue reports.
 
 This image shows the six DAT files in the original PC installation folder:
 

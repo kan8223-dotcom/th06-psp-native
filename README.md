@@ -108,6 +108,7 @@ ef0:/th6/
 PSP/GAME/TH06PSP/
 ├── EBOOT.PBP
 ├── NotoSansJP-Regular.ttf
+├── msgothic.ttc                 ← 任意。MSゴシックを使う場合だけ自分で配置（非同梱）
 ├── README.md
 ├── README_EN.md
 ├── CREDITS.md
@@ -126,6 +127,11 @@ PSP/GAME/TH06PSP/
         ├── th06_01.wav
         └── ... th06_17.wav
 ```
+
+MSゴシックを使う場合は、自分のWindowsにある `C:\Windows\Fonts\msgothic.ttc` を
+`PSP/GAME/TH06PSP/msgothic.ttc`（EBOOTと同じ場所）へコピーしてください。配置は任意です。
+MSゴシックを優先して読み込み、無い場合や読み込めない場合は同梱の `NotoSansJP-Regular.ttf` を使います。
+`msgothic.ttc` はMicrosoftのフォントのため同梱しません。GitHubや不具合報告にも添付しないでください。
 
 原作フォルダ内にある6個のDATファイルを確認する例です。
 
