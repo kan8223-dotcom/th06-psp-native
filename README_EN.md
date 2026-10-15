@@ -39,6 +39,8 @@ This is still a preview, not a finished port. Known limitations include:
 - Short stalls during Memory Stick reads can still occur.
 - Optional MIDI uses your own `gm.dls`; see the setup below. Audio interruptions are not fully resolved:
   the current build's hardware log still records a PCM underrun in the stage 4 interval.
+- Real-time MIDI playback reduces gameplay performance. Using the ME does not eliminate the synthesis overhead,
+  and additional slowdown may occur. Select WAV BGM if gameplay performance is your priority.
 - PSP Go data discovery has been tested in PPSSPP, but switching between `ef0:` internal storage and a real
   Memory Stick Micro has not yet been verified on PSP Go hardware.
 - PPSSPP success does not guarantee compatibility with real PSP hardware.
@@ -174,6 +176,9 @@ instrument file described below is present and the MIDI backend is available.
 **Copy your own `gm.dls` to the Memory Stick, then select MIDI in the title screen's Option menu.**
 The PSP synthesizes the songs using the instruments from Microsoft GS Wavetable Synth (MSGS).
 It does not run the Windows MSGS program, and exact reproduction is not guaranteed.
+
+Real-time MIDI playback reduces gameplay performance. Using the ME does not eliminate the synthesis overhead,
+and additional slowdown may occur. Select WAV BGM if gameplay performance is your priority.
 
 1. Find `C:\Windows\System32\drivers\gm.dls` on your own Windows PC.
 2. Copy it, unrenamed, to `PSP/GAME/TH06PSP/th6/gm.dls`. If you use another original-data folder,

@@ -20,6 +20,8 @@ PSP-1000ではMIDI合成にMEが必要です。PSP-2000/3000などの64MB機に�
 
 ## 確認範囲と既知の制約（2026-10-15）
 
+- MIDI再生はリアルタイム合成の負荷により、ゲームプレイのパフォーマンスを低下させます。
+  ME使用時も処理落ちが増える場合があります。パフォーマンスを優先する場合はBGMをWAVにしてください。
 - 待機修正前のMIDI開発版は、PSP-1000の通常プレイで全6面、ED、結果、タイトル復帰、スコア保存を
   実機ログで確認しています。
 - 現行版はME完了待ちのbusy pollingをやめ、協調待機に戻しています。現行PSP-1000ログは
@@ -44,6 +46,9 @@ If stale instruments remain after replacing the file, exit the game, remove only
 
 This uses a PSP synthesizer, not the Windows MSGS executable. Unavailable MIDI falls back to WAV.
 PSP-1000 requires the ME; 64 MB models such as PSP-2000/3000 also have a main-CPU synthesis path.
+
+Real-time MIDI playback reduces gameplay performance. Using the ME does not eliminate the synthesis overhead,
+and additional slowdown may occur. Select WAV BGM if gameplay performance is your priority.
 
 PSP-1000 logs from the earlier MIDI development build cover the full game, ending, result screen, and score save.
 After replacing busy polling with cooperative waits, current PSP-1000 logs cover play into stage 5 and return to
