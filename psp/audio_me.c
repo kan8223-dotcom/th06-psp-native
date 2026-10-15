@@ -1,4 +1,6 @@
 #include "audio_me.h"
+#include "midi/midi_me_protocol.h"
+#include "midi/MidiExitPolicy.h"
 
 #include <pspiofilemgr.h>
 #include <pspkernel.h>
@@ -21,6 +23,7 @@ enum
     ME_CMD_NONE = 0,
     ME_CMD_AUDIO_MIX = 1,
     ME_CMD_VERTEX_PACK = 2,
+    ME_CMD_MIDI = 3,
     ME_CMD_STOP = 0xff,
     ME_STAT_IDLE = 0,
     ME_STAT_DONE = 1,
@@ -28,6 +31,10 @@ enum
     ME_OWNER_NONE = 0,
     ME_OWNER_AUDIO = 1,
     ME_OWNER_VERTEX = 2,
+
+    ME_ARENA_FREE = 0,
+    ME_ARENA_INIT = 1,
+    ME_ARENA_MIDI = 2,
 
     ME_AUDIO_WAIT_US = 8000,
     ME_VERTEX_WAIT_US = 6000,
@@ -47,6 +54,13 @@ _Static_assert(ME_AUDIO_EDRAM_ACCUM_END == 0x00000c00,
                "ME audio eDRAM footprint changed; re-audit PSPPMD/MECC layout");
 _Static_assert(ME_AUDIO_EDRAM_ACCUM_END < ME_AUDIO_EDRAM_FAT_STACK_TOP,
                "ME audio accumulator collides with the smallest MECC local stack");
+// The MIDI state/blob layout (psp/midi/midi_me_protocol.h) is placed around
+// this accumulator; both tables must describe the same 2 KiB.
+_Static_assert(ME_AUDIO_EDRAM_ACCUM_BASE == TH06_MIDI_EDRAM_ACCUM_BASE &&
+                   ME_AUDIO_EDRAM_ACCUM_END == TH06_MIDI_EDRAM_ACCUM_END,
+               "MIDI eDRAM layout and the mix accumulator disagree");
+_Static_assert(ME_AUDIO_EDRAM_FAT_STACK_TOP == TH06_MIDI_EDRAM_FAT_TOP,
+               "MIDI eDRAM layout assumes the PSP-1000 stack top");
 
 typedef struct MeVertexPosition
 {
@@ -107,6 +121,10 @@ typedef struct MeSharedMailbox
     uint32_t colored;
     uint32_t vertexOutputBytes;
     uint32_t reserved1;
+
+    // MIDI synthesis jobs (psp/midi).  Written by the SC only between
+    // th06_psp_me_midi_begin() and th06_psp_me_midi_finish().
+    Th06MidiMeBox midi;
 } MeSharedMailbox;
 
 static volatile MeSharedMailbox gMeMailbox __attribute__((aligned(64), section(".uncached")));
@@ -118,9 +136,13 @@ static unsigned char gMeVertexArena[ME_VERTEX_ARENA_BYTES] __attribute__((aligne
 static volatile int gMeActive;
 static volatile int gMeStarted;
 static volatile int gMePoisoned;
+static volatile int gMeInitializing;
+static volatile int gMeShuttingDown;
 static volatile int gMeOwner;
 static volatile unsigned int gMeAudioWanted;
-static unsigned int gMeVertexArenaOffset;
+static volatile unsigned int gMeVertexArenaOffset;
+static volatile int gMeArenaOwner;
+static volatile int gMeArenaReady;
 
 static volatile unsigned int gMeJobs;
 static volatile unsigned int gMeFallbacks;
@@ -198,6 +220,13 @@ static int apply_gain_q16(short sample, uint32_t gainQ16)
     return product >> 16;
 }
 
+/* Mixing at unity: the 32-bit sum is clipped to 16 bits like DirectSound did on
+ * the original.  Shared by the SC fallback and the ME job so both stay bit-identical. */
+static inline short saturate16(int v)
+{
+    return (short)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+}
+
 static void mix_on_sc(const Th06PspMixJob *job, short *output)
 {
     const unsigned int frames = job->frames <= TH06_PSP_ME_MAX_MIX_FRAMES
@@ -240,7 +269,7 @@ static void mix_on_sc(const Th06PspMixJob *job, short *output)
 
     const int divisor = job->mixDivisor ? (int)job->mixDivisor : 1;
     for (unsigned int sample = 0; sample < samples; ++sample)
-        output[sample] = (short)(gScWide[sample] / divisor);
+        output[sample] = saturate16(gScWide[sample] / divisor);
 }
 
 static void me_invalidate_stream(uint32_t physical, uint32_t stride,
@@ -342,7 +371,7 @@ static void process_audio_on_me(volatile MeSharedMailbox *box, volatile int *wid
 
         short *chunkOutput = output + chunkStart * 2;
         for (uint32_t sample = 0; sample < chunkSamples; ++sample)
-            chunkOutput[sample] = (short)(wide[sample] / divisor);
+            chunkOutput[sample] = saturate16(wide[sample] / divisor);
     }
     meLibDcacheWritebackRange((uint32_t)output, frames * 2 * sizeof(short));
 }
@@ -454,6 +483,8 @@ void meLibOnProcess(void)
             process_audio_on_me(box, wide);
         else if (command == ME_CMD_VERTEX_PACK)
             process_vertices_on_me(box);
+        else if (command == ME_CMD_MIDI)
+            th06_midi_me_execute(&box->midi);
         else
         {
             box->command = ME_CMD_NONE;
@@ -495,7 +526,7 @@ static int claim_me_for_vertex(void)
         return 0;
     int expected = ME_OWNER_NONE;
     if (!__atomic_compare_exchange_n(&gMeOwner, &expected, ME_OWNER_VERTEX, 0,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
         return 0;
     if (__atomic_load_n(&gMeAudioWanted, __ATOMIC_ACQUIRE) != 0)
     {
@@ -578,14 +609,17 @@ static int dispatch_audio(const Th06PspMixJob *job, short *output)
 
 void th06_psp_me_vertex_frame_begin(void)
 {
-    if (!__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE))
-        gMeVertexArenaOffset = 0;
+    if (!__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&gMeArenaOwner, __ATOMIC_SEQ_CST) != ME_ARENA_MIDI)
+        __atomic_store_n(&gMeVertexArenaOffset, 0u, __ATOMIC_RELEASE);
 }
 
 int th06_psp_me_vertex_pack(const Th06PspMeVertexPack *job, const void **output)
 {
     if (output)
         *output = 0;
+    if (__atomic_load_n(&gMeArenaOwner, __ATOMIC_SEQ_CST) == ME_ARENA_MIDI)
+        return 0;
     if (!job || !output || !job->position || !job->positionStride || !job->count ||
         (job->textured && (!job->texcoord || !job->texcoordStride)) ||
         (job->colored && (!job->diffuse || !job->diffuseStride)) ||
@@ -600,7 +634,8 @@ int th06_psp_me_vertex_pack(const Th06PspMeVertexPack *job, const void **output)
     }
 
     volatile MeSharedMailbox *box = gMeMailboxUncached;
-    if (!box || box->command != ME_CMD_NONE ||
+    if (__atomic_load_n(&gMeArenaOwner, __ATOMIC_SEQ_CST) == ME_ARENA_MIDI ||
+        !box || box->command != ME_CMD_NONE ||
         !__atomic_load_n(&gMeActive, __ATOMIC_ACQUIRE))
     {
         release_me();
@@ -616,7 +651,7 @@ int th06_psp_me_vertex_pack(const Th06PspMeVertexPack *job, const void **output)
         return 0;
     }
     const uint32_t outputBytes = job->count * bytesPerVertex;
-    const uint32_t offset = (gMeVertexArenaOffset + 63u) & ~63u;
+    const uint32_t offset = (__atomic_load_n(&gMeVertexArenaOffset, __ATOMIC_ACQUIRE) + 63u) & ~63u;
     if (offset > ME_VERTEX_ARENA_BYTES || outputBytes > ME_VERTEX_ARENA_BYTES - offset)
     {
         release_me();
@@ -663,10 +698,38 @@ int th06_psp_me_vertex_pack(const Th06PspMeVertexPack *job, const void **output)
 
     const uint32_t waitUs = sceKernelGetSystemTimeLow() - startUs;
     record_max(&gMeMaxWaitUs, waitUs);
-    gMeVertexArenaOffset = offset + outputBytes;
+    __atomic_store_n(&gMeVertexArenaOffset, offset + outputBytes, __ATOMIC_RELEASE);
     *output = destination;
     __atomic_fetch_add(&gMeJobs, 1u, __ATOMIC_RELAXED);
     release_me();
+    return 1;
+}
+
+int th06_psp_me_audio_mix_unity_nowait(const Th06PspMixJob *job, short *output)
+{
+    if (!job || !output || job->frames == 0 || job->frames > TH06_PSP_ME_MAX_MIX_FRAMES ||
+        job->inputCount > TH06_PSP_ME_MAX_MIX_INPUTS || job->mixDivisor != 1u)
+        return 0;
+    // Validate before writing: fractional/NaN gains retain the original ME
+    // path, whose Q16 gain can differ from the SC float fallback by one LSB.
+    for (unsigned int index = 0; index < job->inputCount; ++index)
+        if (job->inputs[index].gain != 1.0f)
+            return 0;
+    if (job->inputCount == 1u)
+    {
+        const Th06PspMixInput *input = &job->inputs[0];
+        if (input->samples && input->channels == 2u && input->destinationFrame == 0u &&
+            input->frames >= job->frames)
+        {
+            memmove(output, input->samples, job->frames * 2u * sizeof(short));
+            return 1;
+        }
+    }
+    // Unity multiplication is exact for every s16 value. At most 64 inputs
+    // sum within signed 32 bits, then use the identical divisor-1 saturation.
+    // This is intentional SC final addition, not MIDI synthesis fallback:
+    // it neither changes ME ownership/read-set nor increments failure stats.
+    mix_on_sc(job, output);
     return 1;
 }
 
@@ -681,6 +744,76 @@ int th06_psp_me_audio_mix(const Th06PspMixJob *job, short *output)
     __atomic_fetch_add(&gMeFallbacks, 1u, __ATOMIC_RELAXED);
     mix_on_sc(job, output);
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// MIDI synthesis jobs (psp/midi/MidiPsp.cpp).  The SC fills the MIDI section
+// of the mailbox only after it owns the worker, exactly like an audio mix job.
+// ---------------------------------------------------------------------------
+int th06_psp_me_available(void)
+{
+    return __atomic_load_n(&gMeActive, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE);
+}
+
+volatile Th06MidiMeBox *th06_psp_me_midi_begin(void)
+{
+    if (!th06_psp_me_available())
+        return 0;
+    const uint32_t startUs = sceKernelGetSystemTimeLow();
+    if (!claim_me_for_audio(startUs))
+        return 0;
+    volatile MeSharedMailbox *box = gMeMailboxUncached;
+    if (!box || box->command != ME_CMD_NONE || !th06_psp_me_available())
+    {
+        release_me();
+        return 0;
+    }
+    return &box->midi;
+}
+
+int th06_psp_me_midi_finish(unsigned int timeoutUs, unsigned int firstSleepUs, unsigned int *waitUs)
+{
+    volatile MeSharedMailbox *box = gMeMailboxUncached;
+    const uint32_t startUs = sceKernelGetSystemTimeLow();
+    if (waitUs)
+        *waitUs = 0;
+    if (!box)
+    {
+        release_me();
+        return 0;
+    }
+    box->status = ME_STAT_IDLE;
+    __asm__ volatile("sync");
+    box->command = ME_CMD_MIDI;
+
+    // The producer outranks the game thread. It must yield while the ME is
+    // synthesizing, otherwise a busy completion poll consumes SC time too
+    // and prevents the game from running in parallel with that synthesis.
+    // Keep the original deadline/ACK/payload lifetime rules. A delayed wake
+    // can still starve PCM during image loading; do not hide that separate
+    // limitation by monopolizing the SC for every normal render job.
+    if (firstSleepUs > 100u && box->status != ME_STAT_DONE)
+        sceKernelDelayThread(firstSleepUs);
+    while (box->status != ME_STAT_DONE)
+    {
+        if (sceKernelGetSystemTimeLow() - startUs >= timeoutUs)
+        {
+            // A late ME may still write its eDRAM, the job's output range and
+            // the mailbox; the SC never reads those again after this point.
+            poison_me();
+            release_me();
+            return 0;
+        }
+        sceKernelDelayThread(50);
+    }
+    const uint32_t elapsed = sceKernelGetSystemTimeLow() - startUs;
+    if (waitUs)
+        *waitUs = elapsed;
+    record_max(&gMeMaxWaitUs, elapsed);
+    __atomic_fetch_add(&gMeJobs, 1u, __ATOMIC_RELAXED);
+    release_me();
+    return 1;
 }
 
 static int selftest_audio(void)
@@ -700,7 +833,7 @@ static int selftest_audio(void)
     memset(&test, 0, sizeof(test));
     test.frames = TH06_PSP_ME_MAX_MIX_FRAMES;
     test.inputCount = 2;
-    test.mixDivisor = 8;
+    test.mixDivisor = 1;
     test.inputs[0].samples = testStereo;
     test.inputs[0].frames = TH06_PSP_ME_MAX_MIX_FRAMES;
     test.inputs[0].channels = 2;
@@ -766,17 +899,21 @@ static int selftest_vertices(void)
     return matched;
 }
 
-int th06_psp_me_audio_init(void)
+static int actual_me_audio_init(void)
 {
+    // A late worker may still use the old mailbox/output after a timeout.
+    if (__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&gMeShuttingDown, __ATOMIC_SEQ_CST))
+        return 0;
     gMeMailboxUncached =
         (volatile MeSharedMailbox *)(0x40000000u | (uint32_t)&gMeMailbox);
     memset((void *)&gMeMailbox, 0, sizeof(gMeMailbox));
     memset(gMeAudioOutput, 0, sizeof(gMeAudioOutput));
     memset(gMeVertexArena, 0, sizeof(gMeVertexArena));
-    gMeOwner = ME_OWNER_NONE;
-    gMeAudioWanted = 0;
-    gMePoisoned = 0;
-    gMeVertexArenaOffset = 0;
+    __atomic_store_n(&gMeOwner, ME_OWNER_NONE, __ATOMIC_RELEASE);
+    __atomic_store_n(&gMeAudioWanted, 0u, __ATOMIC_RELEASE);
+    // Poison is permanent for the boot, including a shutdown/init race.
+    __atomic_store_n(&gMeVertexArenaOffset, 0u, __ATOMIC_RELEASE);
     sceKernelDcacheWritebackInvalidateAll();
 
     if (running_under_ppsspp())
@@ -791,14 +928,24 @@ int th06_psp_me_audio_init(void)
     }
 
     th06_psp_boot_note("ME AUDIO+VTX INIT BEGIN (PSPPMD)");
+    __atomic_store_n(&gMeInitializing, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&gMeShuttingDown, __ATOMIC_SEQ_CST))
+    {
+        __atomic_store_n(&gMeInitializing, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
     const int mapper = meLibDefaultInit();
     th06_psp_boot_notef("ME AUDIO+VTX INIT R%d", mapper);
     if (mapper < 0)
     {
+        __atomic_store_n(&gMeInitializing, 0, __ATOMIC_RELEASE);
         th06_psp_boot_note("ME AUDIO+VTX OFF (SC FALLBACK)");
         return 0;
     }
     __atomic_store_n(&gMeStarted, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&gMeInitializing, 0, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE))
+        return 0;
     __atomic_store_n(&gMeActive, 1, __ATOMIC_RELEASE);
     sceKernelDelayThread(50000);
 
@@ -808,7 +955,7 @@ int th06_psp_me_audio_init(void)
         th06_psp_boot_note("ME AUDIO SELFTEST NG -> ALL SC");
         return 0;
     }
-    gMeVertexArenaOffset = 0;
+    __atomic_store_n(&gMeVertexArenaOffset, 0u, __ATOMIC_RELEASE);
     if (!selftest_vertices())
     {
         __atomic_store_n(&gMeActive, 0, __ATOMIC_RELEASE);
@@ -816,33 +963,161 @@ int th06_psp_me_audio_init(void)
         return 0;
     }
 
-    gMeVertexArenaOffset = 0;
+    __atomic_store_n(&gMeVertexArenaOffset, 0u, __ATOMIC_RELEASE);
     gMeJobs = gMeFallbacks = gMeTimeouts = gMeMaxWaitUs = 0;
     th06_psp_boot_notef("ME AUDIO ON / VTX OFF MAP%d", mapper);
     return 1;
 }
 
+static int song_storage_backend_idle(void)
+{
+    return __atomic_load_n(&gMeArenaReady, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&gMeInitializing, __ATOMIC_SEQ_CST) &&
+           !__atomic_load_n(&gMeShuttingDown, __ATOMIC_SEQ_CST) &&
+           !__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE) &&
+           __atomic_load_n(&gMeOwner, __ATOMIC_SEQ_CST) == ME_OWNER_NONE &&
+           __atomic_load_n(&gMeAudioWanted, __ATOMIC_ACQUIRE) == 0u &&
+           __atomic_load_n(&gMeVertexArenaOffset, __ATOMIC_ACQUIRE) == 0u &&
+           gMeMailboxUncached && gMeMailboxUncached->command == ME_CMD_NONE;
+}
+
+int th06_psp_me_audio_init(void)
+{
+    int expected = ME_ARENA_FREE;
+    // Acquire the arena before the old body touches any mailbox or buffer.
+    // INIT covers its complete selftests even after gMeInitializing clears.
+    if (__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&gMeShuttingDown, __ATOMIC_SEQ_CST) ||
+        __atomic_load_n(&gMeStarted, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&gMeOwner, __ATOMIC_ACQUIRE) != ME_OWNER_NONE ||
+        !__atomic_compare_exchange_n(&gMeArenaOwner, &expected, ME_ARENA_INIT, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return 0;
+    __atomic_store_n(&gMeArenaReady, 0, __ATOMIC_RELEASE);
+    // Complete the same seq_cst init/shutdown handshake as the mapper. If
+    // shutdown observed FREE before this CAS, it must prevent all writers.
+    if (__atomic_load_n(&gMeShuttingDown, __ATOMIC_SEQ_CST) ||
+        __atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE))
+    {
+        __atomic_store_n(&gMeArenaOwner, ME_ARENA_FREE, __ATOMIC_SEQ_CST);
+        return 0;
+    }
+    const int result = actual_me_audio_init();
+    // OFF on PPSSPP / marker is a completed initialization too. Timeouts,
+    // shutdown or an unfinished vertex result never make the arena lendable.
+    if (!__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&gMeShuttingDown, __ATOMIC_SEQ_CST) &&
+        __atomic_load_n(&gMeOwner, __ATOMIC_ACQUIRE) == ME_OWNER_NONE &&
+        __atomic_load_n(&gMeVertexArenaOffset, __ATOMIC_ACQUIRE) == 0u &&
+        gMeMailboxUncached && gMeMailboxUncached->command == ME_CMD_NONE)
+        __atomic_store_n(&gMeArenaReady, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&gMeArenaOwner, ME_ARENA_FREE, __ATOMIC_SEQ_CST);
+    return result;
+}
+
+void *th06_psp_me_borrow_song_storage(unsigned int bytes)
+{
+#if TH06_PSP_ME_VERTEX_PACKING_ENABLED == 0
+    int expected = ME_ARENA_FREE;
+    if (bytes == 0u || bytes > ME_VERTEX_ARENA_BYTES || sizeof(void *) != 4u ||
+        ((uintptr_t)gMeVertexArena & 63u) != 0u || !song_storage_backend_idle() ||
+        !__atomic_compare_exchange_n(&gMeArenaOwner, &expected, ME_ARENA_MIDI, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return 0;
+    // A writer can have claimed the ME after the first idle check. A failed
+    // transaction publishes no pointer; its vertex claim rechecks MIDI too.
+    if (!song_storage_backend_idle())
+    {
+        __atomic_store_n(&gMeArenaOwner, ME_ARENA_FREE, __ATOMIC_SEQ_CST);
+        return 0;
+    }
+    return gMeVertexArena;
+#else
+    (void)bytes;
+    return 0;
+#endif
+}
+
+int th06_psp_me_return_song_storage(void *storage)
+{
+#if TH06_PSP_ME_VERTEX_PACKING_ENABLED == 0
+    int expected = ME_ARENA_MIDI;
+    if (storage != gMeVertexArena || !song_storage_backend_idle())
+        return 0;
+    return __atomic_compare_exchange_n(&gMeArenaOwner, &expected, ME_ARENA_FREE, 0,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+#else
+    (void)storage;
+    return 0;
+#endif
+}
+
 void th06_psp_me_audio_shutdown(void)
 {
+    __atomic_store_n(&gMeShuttingDown, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&gMeActive, 0, __ATOMIC_RELEASE);
-    if (!__atomic_load_n(&gMeStarted, __ATOMIC_ACQUIRE) || !gMeMailboxUncached ||
-        __atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE))
+    // Ordered loads: do not evaluate Started before observing the completion
+    // of initialization (function argument evaluation order is unspecified).
+    const int initializing = __atomic_load_n(&gMeInitializing, __ATOMIC_SEQ_CST) ||
+                             __atomic_load_n(&gMeArenaOwner, __ATOMIC_SEQ_CST) == ME_ARENA_INIT;
+    const int started = __atomic_load_n(&gMeStarted, __ATOMIC_ACQUIRE);
+    const int poisoned = __atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE);
+    const enum Th06MeExitAction action = th06_me_exit_action(
+        initializing, started, poisoned);
+    if (action == TH06_ME_EXIT_HOLD)
+    {
+        poison_me();
+        return;
+    }
+    if (action == TH06_ME_EXIT_NONE || !gMeMailboxUncached)
         return;
 
+    // Acquire exclusive ownership before STOP. A caller may already have
+    // claimed an idle mailbox and not yet published its job command.
     const uint32_t startUs = sceKernelGetSystemTimeLow();
-    while (gMeMailboxUncached->command != ME_CMD_NONE &&
-           sceKernelGetSystemTimeLow() - startUs < ME_AUDIO_WAIT_US)
+    while (1)
+    {
+        int expected = ME_OWNER_NONE;
+        if (__atomic_compare_exchange_n(&gMeOwner, &expected, ME_OWNER_AUDIO, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+        if (sceKernelGetSystemTimeLow() - startUs >= 2000000u)
+        {
+            poison_me();
+            return;
+        }
         sceKernelDelayThread(50);
+    }
+    const int ownerInitializing = __atomic_load_n(&gMeInitializing, __ATOMIC_SEQ_CST) ||
+                                  __atomic_load_n(&gMeArenaOwner, __ATOMIC_SEQ_CST) == ME_ARENA_INIT;
+    const int ownerStarted = __atomic_load_n(&gMeStarted, __ATOMIC_ACQUIRE);
+    const int ownerPoisoned = __atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE);
+    if (th06_me_exit_action(ownerInitializing, ownerStarted, ownerPoisoned) != TH06_ME_EXIT_STOP)
+    {
+        release_me();
+        return;
+    }
     if (gMeMailboxUncached->command == ME_CMD_NONE)
     {
         gMeMailboxUncached->status = ME_STAT_IDLE;
         __asm__ volatile("sync");
         gMeMailboxUncached->command = ME_CMD_STOP;
         while (gMeMailboxUncached->status != ME_STAT_DONE &&
-               sceKernelGetSystemTimeLow() - startUs < ME_AUDIO_WAIT_US)
+               sceKernelGetSystemTimeLow() - startUs < 2000000u)
             sceKernelDelayThread(50);
+        if (gMeMailboxUncached->status != ME_STAT_DONE)
+            poison_me();
     }
-    __atomic_store_n(&gMeStarted, 0, __ATOMIC_RELEASE);
+    else
+        poison_me();
+    if (!__atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE))
+        __atomic_store_n(&gMeStarted, 0, __ATOMIC_RELEASE);
+    release_me();
+}
+
+int th06_psp_me_poisoned(void)
+{
+    return __atomic_load_n(&gMePoisoned, __ATOMIC_ACQUIRE);
 }
 
 void th06_psp_me_audio_diag_window(unsigned int *jobs, unsigned int *fallbacks,

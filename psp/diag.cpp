@@ -8,6 +8,7 @@
 #include "diag.hpp"
 
 #include <pspctrl.h>
+#include <pspdisplay.h>
 #include <pspkernel.h>
 #include <psppower.h>
 #include <pspsysmem.h>
@@ -16,6 +17,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "midi/MidiPsp.hpp"
+#include "audio_me.h"
 #include "video.hpp"
 
 namespace
@@ -111,6 +114,82 @@ constexpr unsigned int kBgmIoStallDiagnosticUs = 100u * 1000u;
 
 AudioFlightRecord gAudioFlight{};
 volatile int gAudioFlightSampling;
+
+extern "C" void th06_psp_frame_pacing(unsigned int *frames, unsigned int *misses, unsigned int *extraVblanks,
+                                      unsigned int *worstUs);
+
+// MIDI synthesis telemetry kept across the 5-second windows (diag thread
+// only) and written once at a checkpoint, like the audio flight record.
+struct MidiFlightRecord
+{
+    unsigned int windows;
+    unsigned int loadMaxPermille;
+    unsigned int waitMaxUs;
+    unsigned long long frames;
+    unsigned long long waitTotalUs;
+    unsigned int activeMax;
+};
+MidiFlightRecord gMidiFlight{};
+unsigned int gLastPacingFrames, gLastPacingMisses, gLastPacingExtra;
+
+const char *MidiModeName(unsigned int mode)
+{
+#if defined(TH06_PSP_MIDI_MEMSIM)
+    if (mode == 3)
+        return "MEMSIM";
+#endif
+    return mode == 2 ? "ME" : (mode == 1 ? "SC" : "OFF");
+}
+
+struct MidiDiagWindow
+{
+    Th06MidiDiag midi;
+    unsigned int frames, misses, extra, worst;
+    unsigned int windowFrames, windowMisses, windowExtra;
+};
+
+// The caller holds gAudioFlightSampling across both audio and MIDI RAM
+// updates. No Memory Stick writes occur while this try-lock is held.
+void SampleMidiWindow(MidiDiagWindow &window)
+{
+    Th06MidiDiag &midi = window.midi;
+    th06_midi_diag_window(&midi);
+    th06_psp_frame_pacing(&window.frames, &window.misses, &window.extra, &window.worst);
+    window.windowFrames = window.frames - gLastPacingFrames;
+    window.windowMisses = window.misses - gLastPacingMisses;
+    window.windowExtra = window.extra - gLastPacingExtra;
+    gLastPacingFrames = window.frames;
+    gLastPacingMisses = window.misses;
+    gLastPacingExtra = window.extra;
+    if (midi.frames != 0)
+    {
+        ++gMidiFlight.windows;
+        gMidiFlight.frames += midi.frames;
+        gMidiFlight.waitTotalUs += midi.waitTotalUs;
+        if (midi.loadPermille > gMidiFlight.loadMaxPermille)
+            gMidiFlight.loadMaxPermille = midi.loadPermille;
+        if (midi.waitMaxUs > gMidiFlight.waitMaxUs)
+            gMidiFlight.waitMaxUs = midi.waitMaxUs;
+        if (midi.activeMax > gMidiFlight.activeMax)
+            gMidiFlight.activeMax = midi.activeMax;
+    }
+}
+
+void EmitMidiWindow(const MidiDiagWindow &window)
+{
+    const Th06MidiDiag &midi = window.midi;
+    // MISS: presented frames in this window whose interval missed a vblank
+    // (the 60 Hz sim ran slow), and how many vblanks were lost in total.
+    th06_psp_boot_notef("PACE F+%u MISS+%u VB+%u TOTAL %u/%u WORST%uus", window.windowFrames,
+                        window.windowMisses, window.windowExtra, window.misses, window.frames, window.worst);
+    if (midi.mode != 0)
+        th06_psp_boot_notef("MIDI %s J%u/%u F%u QD%u W%u/%uus L%u.%u%% CY%uK V%u LOST%u SCR%u/%u/%u FB%u/%u S%u/%u C%u",
+                            MidiModeName(midi.mode), midi.meJobs, midi.scJobs, midi.frames, midi.queueDrops, midi.waitTotalUs,
+                            midi.waitMaxUs, midi.loadPermille / 10u, midi.loadPermille % 10u,
+                            midi.renderCyclesMax / 1000u, midi.activeMax, midi.notesLost, midi.scrubPasses,
+                            midi.scrubBad, midi.scrubRepaired, midi.fallbacks, midi.fallbackReason,
+                            midi.songsLoaded, midi.songsFreed, midi.commands);
+}
 
 struct AudioDiagWindow
 {
@@ -235,18 +314,71 @@ void ExitToXmbAfterNotice(const char *title, const char *detail)
 
 int WatchdogThread(SceSize, void *)
 {
+    unsigned int lastHeartbeatFrames = __atomic_load_n(&gFramesPresented, __ATOMIC_RELAXED);
+    unsigned int lastHeartbeatUs = sceKernelGetSystemTimeLow();
     for (;;)
     {
         sceKernelDelayThread(250 * 1000);
-        if (!gWatchdogArmed)
-            continue;
         const unsigned int now = sceKernelGetSystemTimeLow();
-        if (static_cast<int>(now - gWatchdogDeadlineUs) < 0)
+        // Boot protection always runs at the original 0x12 priority, before
+        // any optional runtime telemetry. Disarming boot must not disable
+        // the runtime RAM flight recorder.
+        if (gWatchdogArmed && static_cast<int>(now - gWatchdogDeadlineUs) >= 0)
+        {
+            gWatchdogArmed = 0;
+            th06_psp_boot_notef("WATCHDOG TIMEOUT %us AFTER: %s", gWatchdogTimeoutUs / 1000000u, gLastNote);
+            ExitToXmbAfterNotice("BOOT WATCHDOG", gLastNote);
+            return 0;
+        }
+        if (!gBootPhaseEnded || static_cast<unsigned int>(now - lastHeartbeatUs) < kRuntimeHeartbeatUs)
             continue;
-        gWatchdogArmed = 0;
-        th06_psp_boot_notef("WATCHDOG TIMEOUT %us AFTER: %s", gWatchdogTimeoutUs / 1000000u, gLastNote);
-        ExitToXmbAfterNotice("BOOT WATCHDOG", gLastNote);
-        return 0;
+
+        const unsigned int frames = __atomic_load_n(&gFramesPresented, __ATOMIC_RELAXED);
+        AudioDiagWindow audio{};
+        MidiDiagWindow midi{};
+        const bool sampled = CollectAudioDiagnostics(audio, true);
+        if (sampled)
+        {
+            SampleMidiWindow(midi);
+            __atomic_store_n(&gAudioFlightSampling, 0, __ATOMIC_RELEASE);
+        }
+        if (sampled && th06_psp_periodic_diag_enabled())
+        {
+            // FAT appends can take tens of ms. Only the optional write batch
+            // yields to the 0x18 PCM producer; output (0x10), boot control
+            // (0x12 between batches), and HOME/combo (separate 0x0f thread)
+            // keep their priorities. No new thread, buffer or PCM lookahead.
+            const int originalPriority = sceKernelGetThreadCurrentPriority();
+            const SceUID self = sceKernelGetThreadId();
+            if (originalPriority > 0 && sceKernelChangeThreadPriority(self, 0x1c) == 0)
+            {
+                th06_psp_boot_notef("RUN F%u +%u Q%u U%u RW%u/%u MEM%u/%uKB", frames,
+                                    frames - lastHeartbeatFrames, audio.queued, audio.underruns,
+                                    audio.readFrame, audio.writeFrame,
+                                    static_cast<unsigned int>(sceKernelTotalFreeMemSize() / 1024),
+                                    static_cast<unsigned int>(sceKernelMaxFreeMemSize() / 1024));
+                th06_psp_boot_notef("AUD U+%u MIN%u DROP%u GAP%uus MIX%uus IO%uus R%u CM%u/%u",
+                                    audio.underrunDelta, audio.minQueued, audio.droppedFrames,
+                                    audio.maxProducerGapUs, audio.maxMixUs, audio.maxBgmReadUs,
+                                    audio.bgmReads, audio.bgmMissPasses, audio.bgmMissFrames);
+                th06_psp_boot_notef("ME AUD J%u SC%u TO%u W%uus", audio.meJobs, audio.meFallbacks,
+                                    audio.meTimeouts, audio.meMaxWaitUs);
+                EmitMidiWindow(midi);
+                // There are no early returns inside the demoted batch. A
+                // restore failure must not silently leave control demoted:
+                // the untouched 0x0f escape thread performs the safe exit.
+                if (sceKernelChangeThreadPriority(self, originalPriority) < 0 &&
+                    sceKernelGetThreadCurrentPriority() != originalPriority)
+                {
+                    th06_psp_request_exit(4);
+                    return 0;
+                }
+            }
+            // Failed demotion skips only durable periodic writes; the RAM
+            // samples above remain available to transition/failure capture.
+        }
+        lastHeartbeatFrames = frames;
+        lastHeartbeatUs = now;
     }
 }
 
@@ -256,9 +388,7 @@ int EscapeThread(SceSize, void *)
     int heldTicks = 0;
     unsigned int lastFrames = __atomic_load_n(&gFramesPresented, __ATOMIC_RELAXED);
     unsigned int lastRuntimeProgress = __atomic_load_n(&gRuntimeProgress, __ATOMIC_RELAXED);
-    unsigned int lastHeartbeatFrames = lastFrames;
     unsigned int lastProgressUs = sceKernelGetSystemTimeLow();
-    unsigned int lastHeartbeatUs = lastProgressUs;
     unsigned int lastPowerTickUs = lastProgressUs;
     th06_psp_boot_note("DIAG MONITOR READY");
     for (;;)
@@ -301,28 +431,6 @@ int EscapeThread(SceSize, void *)
             heldTicks = 0;
         }
 
-        if (gBootPhaseEnded && static_cast<unsigned int>(now - lastHeartbeatUs) >= kRuntimeHeartbeatUs)
-        {
-            AudioDiagWindow audio{};
-            const bool audioSampled = CollectAudioDiagnostics(audio);
-            const unsigned int deltaFrames = frames - lastHeartbeatFrames;
-            if (audioSampled && th06_psp_periodic_diag_enabled())
-            {
-                th06_psp_boot_notef("RUN F%u +%u Q%u U%u RW%u/%u MEM%u/%uKB", frames, deltaFrames,
-                                    audio.queued, audio.underruns, audio.readFrame, audio.writeFrame,
-                                    static_cast<unsigned int>(sceKernelTotalFreeMemSize() / 1024),
-                                    static_cast<unsigned int>(sceKernelMaxFreeMemSize() / 1024));
-                th06_psp_boot_notef("AUD U+%u MIN%u DROP%u GAP%uus MIX%uus IO%uus R%u CM%u/%u",
-                                    audio.underrunDelta, audio.minQueued, audio.droppedFrames,
-                                    audio.maxProducerGapUs, audio.maxMixUs, audio.maxBgmReadUs,
-                                    audio.bgmReads, audio.bgmMissPasses, audio.bgmMissFrames);
-                th06_psp_boot_notef("ME AUD J%u SC%u TO%u W%uus", audio.meJobs, audio.meFallbacks,
-                                    audio.meTimeouts, audio.meMaxWaitUs);
-            }
-            lastHeartbeatFrames = frames;
-            lastHeartbeatUs = now;
-        }
-
         if (gBootPhaseEnded && static_cast<unsigned int>(now - lastProgressUs) >= kRuntimeStallUs &&
             __atomic_load_n(&gExitRequested, __ATOMIC_ACQUIRE) == 0)
         {
@@ -334,7 +442,9 @@ int EscapeThread(SceSize, void *)
         const int exitReason = __atomic_exchange_n(&gExitRequested, 0, __ATOMIC_ACQ_REL);
         if (exitReason != 0)
         {
-            const char *name = exitReason == 1 ? "HOME" : (exitReason == 2 ? "COMBO" : "STALL");
+            const char *name = exitReason == 1 ? "HOME" :
+                (exitReason == 2 ? "COMBO" : (exitReason == 4 ? "DIAG PRIORITY" :
+                 (exitReason == 5 ? "AUDIO PRIORITY" : "STALL")));
             // STALL was captured immediately above.  HOME/COMBO need the same
             // last-moment RAM snapshot before the process leaves.
             if (exitReason != 3)
@@ -363,6 +473,7 @@ extern "C" void th06_psp_audio_diag_checkpoint(const char *tag, int always)
     // Copy and retire the interval before touching FAT.  The five-second
     // collector can resume while the one durable line is being appended.
     const AudioFlightRecord record = gAudioFlight;
+    const MidiFlightRecord midiRecord = gMidiFlight;
     ResetAudioFlightInterval();
     __atomic_store_n(&gAudioFlightSampling, 0, __ATOMIC_RELEASE);
 
@@ -374,6 +485,21 @@ extern "C" void th06_psp_audio_diag_checkpoint(const char *tag, int always)
     // 08 BGM cache miss, 10 ME timeout, 20 PCM queue drop.  This single line
     // is enough to distinguish the four suspected audio failure classes and
     // avoids a burst of competing Memory Stick writes at the checkpoint.
+    if (midiRecord.windows != 0)
+    {
+        const unsigned long long audioUs = midiRecord.frames * 1000000ull / 44100ull;
+        const unsigned int avgPermille =
+            audioUs ? static_cast<unsigned int>(midiRecord.waitTotalUs * 1000ull / audioUs) : 0u;
+        Th06MidiDiag midi{};
+        th06_midi_diag_window(&midi);
+        unsigned int frames = 0, misses = 0, extra = 0, worst = 0;
+        th06_psp_frame_pacing(&frames, &misses, &extra, &worst);
+        th06_psp_boot_notef("MIDI! %s %s QD%u LOAD AVG%u.%u%% MAX%u.%u%% WMAX%uus V%u FB%u/%u SCR%u/%u MISS%u/%u",
+                            tag ? tag : "?", MidiModeName(midi.mode), midi.queueDrops, avgPermille / 10u, avgPermille % 10u,
+                            midiRecord.loadMaxPermille / 10u, midiRecord.loadMaxPermille % 10u,
+                            midiRecord.waitMaxUs, midiRecord.activeMax, midi.fallbacks, midi.fallbackReason,
+                            midi.scrubBad, midi.scrubRepaired, misses, frames);
+    }
     th06_psp_boot_notef("AUD! %s C%X U%u Q%u G%u I%u CM%u/%u ME%u/%u/%u D%u M%u R%u",
                         tag ? tag : "?", record.anomalyBits, record.underruns, minimum,
                         record.maxProducerGapUs, record.maxBgmReadUs, record.bgmMissPasses,
@@ -512,4 +638,53 @@ extern "C" void th06_psp_request_exit(int reason)
 extern "C" void th06_psp_fatal_exit(const char *title, const char *detail)
 {
     ExitToXmbAfterNotice(title ? title : "FATAL ERROR", detail ? detail : "UNKNOWN");
+}
+
+extern "C" void th06_psp_require_power_off(const char *detail)
+{
+    th06_psp_watchdog_disarm();
+    th06_psp_boot_notef("POWER OFF REQUIRED: %s", detail ? detail : "ME UNACKNOWLEDGED");
+    th06_psp_video_init();
+    for (;;)
+    {
+        // Failure path only. The application and all borrowed memory remain
+        // loaded; HOME/COMBO/watchdog must not free code beneath a late ME.
+        FillRect(0, th06_psp_video_height(), 0xff202060u);
+        th06_psp_text_draw(8, 60, 3, 0xffffffffu, "POWER OFF REQUIRED");
+        th06_psp_text_draw(8, 110, 2, kHighlight, detail ? detail : "ME UNACKNOWLEDGED");
+        th06_psp_text_draw(8, 190, 2, kForeground, "DO NOT START ANOTHER APP");
+        sceDisplaySetFrameBuf(const_cast<unsigned int *>(th06_psp_video_pixels()), th06_psp_video_stride(),
+                              PSP_DISPLAY_PIXEL_FORMAT_8888, PSP_DISPLAY_SETBUF_NEXTFRAME);
+        scePowerTick(PSP_POWER_TICK_ALL);
+        sceKernelDelayThread(250000);
+    }
+}
+
+extern "C" void __real_sceKernelExitGame(void);
+extern "C" void __wrap_sceKernelExitGame(void)
+{
+    static volatile int exiting;
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&exiting, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        for (;;) sceKernelDelayThread(250000);
+#if !defined(TH06_PSP_BOOT_PROBE)
+#if defined(TH06_PSP_RECORD_SOAK)
+    // A normal unattended exit follows the final title, after the last
+    // GameManager checkpoint. Preserve cumulative command-drop/failure
+    // counts even if no periodic window was printed in that last interval.
+    // This is diagnostic exit-only; it cannot serve as game-time ME proof.
+    Th06MidiDiag midi{};
+    th06_midi_diag_window(&midi);
+    th06_psp_boot_notef("RECORD SOAK MIDI FINAL BACKEND %s J%u/%u F%u QD%u FB%u/%u SCR%u/%u/%u PIN%u/%u",
+                        MidiModeName(midi.mode), midi.meJobs, midi.scJobs, midi.frames, midi.queueDrops,
+                        midi.fallbacks, midi.fallbackReason, midi.scrubPasses, midi.scrubBad,
+                        midi.scrubRepaired, midi.pinnedSmfBytes, midi.pinnedBlobBytes);
+#endif
+    // Exit-only guard, not a branch in the normal audio/render paths.
+    th06_psp_me_audio_shutdown();
+    if (th06_psp_me_poisoned())
+        th06_psp_require_power_off("ME STOP NOT ACKNOWLEDGED");
+#endif
+    __real_sceKernelExitGame();
+    __atomic_store_n(&exiting, 0, __ATOMIC_RELEASE);
 }

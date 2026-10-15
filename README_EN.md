@@ -15,38 +15,37 @@ It is not an emulator, and it is unrelated to the older project with the similar
   directly to the Graphics Engine (GE); it does not use a D3D/OpenGL wrapper.
 - On real hardware, PCM audio mixing uses m-c/d's
   [Media Engine Custom Core (MECC)](https://github.com/mcidclan/psp-media-engine-custom-core).
-  If the Media Engine is unavailable, the port safely falls back to the main CPU.
+  The Media Engine (ME) is also used for MIDI synthesis. See the MIDI section below for model-specific
+  requirements and fallback behavior.
 - The original 640x480 game coordinate system is preserved and displayed on the 480x272 PSP screen as either
   `4:3 FIT` with side bars or `FULL STRETCH`.
 
 ## Current status
 
-A PSP-3000 hardware run completed stages 1 through 6, defeated Remilia, displayed the ending and staff roll,
-and returned to the title screen.
+Download the MIDI build: [v1.1.0-preview](https://github.com/kan8223-dotcom/th06-psp-native/releases/tag/v1.1.0-preview).
 
-On PSP-1000 hardware, the v1.0.1 stage-transition fixes completed every transition from stage 1 through stage 6.
-That run ended in a game over during stage 6 before reaching Remilia, so the final boss, ending, staff roll,
-and return to the title screen have not yet been verified on PSP-1000.
+The 2026-10-15 preview supports real-time MIDI playback using your own `gm.dls`.
+Main-CPU busy polling during ME completion waits was removed; waiting now yields CPU time to the game.
 
-Before the latest result-screen fixes, that PSP-1000 run showed a white name-entry background and took a long time
-to exit after choosing Continue "No." The v1.0.1 code includes fixes for the full-screen background allocation and
-the score-save allocation. A continuous PPSSPP test configured as a 32 MB PSP-1000 completed stages 1 through 6,
-operated the result screen, and saved a valid score file. The normal build still needs a PSP-1000 hardware retest of
-the result screen and score save.
+PSP-1000 hardware logs from the MIDI development build before that wait change confirm stages 1–6, the ending,
+result screen, return to title, and score save. Logs from the current build cover play into stage 5 and return to
+title; the user reports more responsive play. The user also reports completing a full run with the current build
+on PSP-3000. These results do not guarantee 60 fps, uninterrupted audio, or exact Windows MSGS reproduction.
 
 This is still a preview, not a finished port. Known limitations include:
 
 - GE optimization is incomplete. Busy backgrounds, portraits, and large bullet clears can make the frame rate
-  step down from 60 fps to about 30 fps.
-- PSP-1000 is somewhat slower than PSP-3000, and short stalls during Memory Stick reads can still occur.
-- The PSP build uses the original WAV music. MIDI output is unsupported; selecting MIDI falls back to WAV.
+  drop to 30 fps or below.
+- Short stalls during Memory Stick reads can still occur.
+- Optional MIDI uses your own `gm.dls`; see the setup below. Audio interruptions are not fully resolved:
+  the current build's hardware log still records a PCM underrun in the stage 4 interval.
 - PSP Go data discovery has been tested in PPSSPP, but switching between `ef0:` internal storage and a real
   Memory Stick Micro has not yet been verified on PSP Go hardware.
 - PPSSPP success does not guarantee compatibility with real PSP hardware.
 - Back up existing score, configuration, and replay files. Their compatibility and integrity are not guaranteed.
 
-Release history is in [CHANGELOG.md](CHANGELOG.md). The latest hardware and 32 MB test boundaries are recorded in
-[docs/50-validation.md](docs/50-validation.md) (currently written in Japanese).
+Release history is in [CHANGELOG.md](CHANGELOG.md). Further MIDI setup notes and test boundaries are in
+[docs/53-midi.md](docs/53-midi.md).
 
 ## What you need
 
@@ -61,6 +60,8 @@ The installed PC folder must contain all six original DAT archives and the 17 WA
 This project does not provide the original game, original data, or instructions for obtaining them or CFW.
 
 ## CFW compatibility notes
+
+The following notes concern earlier releases, not a full CFW compatibility retest of this MIDI build.
 
 - **PSP-1000 / 6.60 PRO-B10:** the released v1.0.0 build was reproduced crashing after stage 2.
   With the v1.0.1 fixes, a PSP-1000 hardware run successfully transitioned through stages 1 to 6.
@@ -105,6 +106,7 @@ PSP/GAME/TH06PSP/
     ├── 紅魔郷MD.DAT
     ├── 紅魔郷ST.DAT
     ├── 紅魔郷TL.DAT
+    ├── gm.dls                   <- optional; supply your own for MIDI
     └── bgm/
         ├── th06_01.wav
         └── ... th06_17.wav
@@ -164,8 +166,33 @@ under the EBOOT's `TH06PSP` folder instead.
 If the game stops responding, hold **L + R + START for about one second** to request an emergency return to the XMB.
 Try this before forcing the PSP to power off.
 
-In Options, use the screen-mode row to choose `4:3 FIT` or `FULL STRETCH`. The inherited MIDI option is visible for
-compatibility with the original menu, but the PSP build always returns to WAV playback.
+In Options, use the screen-mode row to choose `4:3 FIT` or `FULL STRETCH`. MIDI BGM is available when the optional
+instrument file described below is present and the MIDI backend is available.
+
+## Optional MIDI: use your own MSGS instrument file
+
+**Copy your own `gm.dls` to the Memory Stick, then select MIDI in the title screen's Option menu.**
+The PSP synthesizes the songs using the instruments from Microsoft GS Wavetable Synth (MSGS).
+It does not run the Windows MSGS program, and exact reproduction is not guaranteed.
+
+1. Find `C:\Windows\System32\drivers\gm.dls` on your own Windows PC.
+2. Copy it, unrenamed, to `PSP/GAME/TH06PSP/th6/gm.dls`. If you use another original-data folder,
+   put it directly inside that selected folder instead.
+3. Start the game. The first boot automatically builds `PSP/GAME/TH06PSP/MIDICACHE.BIN` (about 1.2 MB)
+   with the instruments needed by the original MIDI songs. The first boot takes longer.
+4. Set BGM to MIDI in Option.
+
+Keep `gm.dls` even after the cache is created. All six original DAT archives and all 17 WAV tracks are still required.
+No SF2 file or Windows MSGS executable is required.
+If an old cache remains after replacing the instruments, remove `MIDICACHE.BIN` and restart to rebuild it.
+
+Without usable instruments/backend, BGM falls back to WAV. PSP-1000 requires the ME for MIDI;
+PSP-2000/3000 and later models also have a main-CPU synthesis fallback, without a performance guarantee.
+The normal release EBOOT has no automatic controls, invulnerability, or unattended-test exit.
+
+`gm.dls` is Microsoft's copyrighted instrument file. Neither it, instrument/waveform data, its generated cache,
+nor the original MIDI songs are included. Supply your own file and do not upload these files to the repository
+or attach them to issue reports.
 
 ## If something goes wrong
 
@@ -210,7 +237,8 @@ The repository and release package do not include:
 - original or development replays (`.rpy`);
 - score, configuration, log, or other user data;
 - `TH06PSP_DATA_PATH.TXT`;
-- Microsoft fonts.
+- Microsoft fonts;
+- `gm.dls`, its generated `MIDICACHE.BIN`, or original MIDI songs.
 
 The release does not ship a populated `replay/` folder. The game creates and uses it on your own storage when needed.
 
@@ -228,6 +256,8 @@ or sharing original game data are out of scope.
 
 For developers, install PSPDEV/PSPSDK at `/usr/local/pspdev` and make sure CMake, Python, and `xxd` are available.
 The bundled m-c/d MECC source is built automatically on the first `make`.
+The shared MIDI synthesizer and sequencer sources are bundled in `third_party/touhou_dls_common`.
+Building the program does not require a separate local checkout or any instrument file.
 
 ```sh
 make -j"$(nproc)" all

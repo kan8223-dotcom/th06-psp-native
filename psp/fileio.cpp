@@ -562,6 +562,17 @@ extern "C" int th06_psp_select_data_candidate(int index)
     return gOriginalDataReady ? 1 : 0;
 }
 
+// Resolved path of one of the six retail archives (engine name such as
+// u8"紅魔郷MD.DAT"), or nullptr when it was not found.
+extern "C" const char *th06_psp_retail_data_path(const char *engineName)
+{
+    th06_psp_fileio_init();
+    const int index = RetailDataIndex(engineName);
+    if (index < 0 || gRetailDataPaths[index][0] == '\0')
+        return nullptr;
+    return gRetailDataPaths[index];
+}
+
 extern "C" const char *th06_psp_boot_log_path()
 {
     return gBootLog;
@@ -583,7 +594,13 @@ extern "C" void th06_psp_boot_note(const char *message)
 
 extern "C" void th06_psp_boot_notef(const char *fmt, ...)
 {
+#if defined(TH06_PSP_RECORD_SOAK)
+    // Exact allocator geometry at one boundary must remain one complete log
+    // record. The ordinary build retains its small boot-note stack buffer.
+    char message[384];
+#else
     char message[128];
+#endif
     va_list args;
     va_start(args, fmt);
     std::vsnprintf(message, sizeof(message), fmt, args);

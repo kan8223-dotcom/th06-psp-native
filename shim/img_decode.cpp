@@ -8,6 +8,8 @@
 #include <jpeglib.h>
 #include <png.h>
 
+#include "psp_jpeg_gu.hpp"
+
 // ---------------------------------------------------------------- helpers
 static SDL_Surface *AllocSurfaceRGBA32(int w, int h)
 {
@@ -273,6 +275,179 @@ static void JpegErrorExit(j_common_ptr cinfo)
 {
     JpegErrorMgr *err = (JpegErrorMgr *)cinfo->err;
     longjmp(err->jmp, 1);
+}
+
+// Source positions and interpolation exactly match BuildSurfaceAxisSamples
+// in PspGuGfx. Keep full-resolution libjpeg output and its default IDCT/color
+// conversion, so the only change is the lifetime of decoded RGB scanlines.
+struct JpegGuAxisSample
+{
+    unsigned short first;
+    unsigned short second;
+    unsigned short fraction;
+};
+
+static void BuildJpegGuAxisSamples(JpegGuAxisSample *samples, unsigned int destinationSize,
+                                   unsigned int sourceSize)
+{
+    for (unsigned int i = 0; i < destinationSize; ++i)
+    {
+        long long fixed = static_cast<long long>(
+                              (static_cast<unsigned long long>(i * 2u + 1u) * sourceSize * 128u) /
+                              destinationSize) - 128;
+        const long long last = static_cast<long long>(sourceSize - 1u) * 256;
+        if (fixed < 0) fixed = 0;
+        if (fixed > last) fixed = last;
+        samples[i].first = static_cast<unsigned short>(fixed >> 8);
+        samples[i].second = static_cast<unsigned short>(
+            samples[i].first + 1u < sourceSize ? samples[i].first + 1u : sourceSize - 1u);
+        samples[i].fraction = static_cast<unsigned short>(fixed & 255);
+    }
+}
+
+extern "C" int th06_psp_img_jpeg_dimensions(const unsigned char *data, size_t size,
+                                            unsigned int *width, unsigned int *height)
+{
+    if (!data || size < 2 || data[0] != 0xff || data[1] != 0xd8 || !width || !height)
+        return 0;
+
+    // The libjpeg object lives in a small heap block so its modified members
+    // remain defined across error longjmp. Its pointer is never reassigned
+    // after setjmp; destroy is safe even if create fails with mem still null.
+    auto *const cinfo = static_cast<jpeg_decompress_struct *>(calloc(1, sizeof(jpeg_decompress_struct)));
+    if (!cinfo) return 0;
+    JpegErrorMgr jerr{};
+    cinfo->err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = JpegErrorExit;
+    if (setjmp(jerr.jmp))
+    {
+        jpeg_destroy_decompress(cinfo);
+        free(cinfo);
+        return 0;
+    }
+    jpeg_create_decompress(cinfo);
+    jpeg_mem_src(cinfo, const_cast<unsigned char *>(data), static_cast<unsigned long>(size));
+    jpeg_read_header(cinfo, TRUE);
+    const unsigned int sourceWidth = cinfo->image_width;
+    const unsigned int sourceHeight = cinfo->image_height;
+    const bool valid = sourceWidth != 0 && sourceHeight != 0 &&
+                       sourceWidth <= 65535u && sourceHeight <= 65535u;
+    jpeg_destroy_decompress(cinfo);
+    free(cinfo);
+    if (!valid) return 0;
+    *width = sourceWidth;
+    *height = sourceHeight;
+    return 1;
+}
+
+extern "C" int th06_psp_img_load_jpeg_gu565(const unsigned char *data, size_t size,
+                                           void *destination, size_t destinationBytes,
+                                           unsigned int storageWidth, unsigned int storageHeight,
+                                           unsigned int targetWidth, unsigned int targetHeight)
+{
+    if (!data || size < 2 || data[0] != 0xff || data[1] != 0xd8 || !destination ||
+        storageWidth == 0 || storageHeight == 0 || storageWidth > 512u || storageHeight > 512u ||
+        (storageWidth & (storageWidth - 1u)) != 0 || (storageHeight & (storageHeight - 1u)) != 0 ||
+        targetWidth == 0 || targetHeight == 0 || targetWidth > storageWidth || targetHeight > storageHeight)
+        return 0;
+    const size_t storageBytes = static_cast<size_t>(storageWidth) * storageHeight * 2u;
+    if (destinationBytes < storageBytes) return 0;
+
+    auto *const cinfo = static_cast<jpeg_decompress_struct *>(calloc(1, sizeof(jpeg_decompress_struct)));
+    if (!cinfo) return 0;
+    JpegErrorMgr jerr{};
+    cinfo->err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = JpegErrorExit;
+    unsigned char *volatile rowsToFree = nullptr;
+    if (setjmp(jerr.jmp))
+    {
+        jpeg_destroy_decompress(cinfo);
+        free(rowsToFree);
+        free(cinfo);
+        return 0;
+    }
+    jpeg_create_decompress(cinfo);
+    jpeg_mem_src(cinfo, const_cast<unsigned char *>(data), static_cast<unsigned long>(size));
+    jpeg_read_header(cinfo, TRUE);
+    cinfo->out_color_space = JCS_RGB;
+    cinfo->scale_num = 1;
+    cinfo->scale_denom = 1;
+    if (!jpeg_start_decompress(cinfo) || cinfo->output_components != 3 ||
+        cinfo->output_width == 0 || cinfo->output_height == 0 ||
+        cinfo->output_width > 65535u || cinfo->output_height > 65535u)
+        JpegErrorExit(reinterpret_cast<j_common_ptr>(cinfo));
+
+    const unsigned int sourceWidth = cinfo->output_width;
+    const unsigned int sourceHeight = cinfo->output_height;
+    const size_t rowBytes = static_cast<size_t>(sourceWidth) * 3u;
+    rowsToFree = static_cast<unsigned char *>(malloc(rowBytes * 2u));
+    if (!rowsToFree) JpegErrorExit(reinterpret_cast<j_common_ptr>(cinfo));
+    unsigned char *const rows = rowsToFree;
+    JpegGuAxisSample xSamples[512];
+    JpegGuAxisSample ySamples[512];
+    BuildJpegGuAxisSamples(xSamples, targetWidth, sourceWidth);
+    BuildJpegGuAxisSamples(ySamples, targetHeight, sourceHeight);
+    memset(destination, 0, storageBytes);
+    auto *const output = static_cast<unsigned char *>(destination);
+    const unsigned int outputRowBytes = storageWidth * 2u;
+    const bool swizzled = outputRowBytes >= 16u && storageHeight >= 8u;
+
+    for (unsigned int y = 0; y < targetHeight; ++y)
+    {
+        const JpegGuAxisSample sy = ySamples[y];
+        // sy.second increases monotonically; its immediate predecessor is
+        // sy.first, so the two alternating scanline slots retain both rows.
+        while (cinfo->output_scanline <= sy.second)
+        {
+            JSAMPROW row = rows + (cinfo->output_scanline & 1u) * rowBytes;
+            if (jpeg_read_scanlines(cinfo, &row, 1) != 1)
+                JpegErrorExit(reinterpret_cast<j_common_ptr>(cinfo));
+        }
+        const unsigned char *const row0 = rows + (sy.first & 1u) * rowBytes;
+        const unsigned char *const row1 = rows + (sy.second & 1u) * rowBytes;
+        const unsigned int wy0 = 256u - sy.fraction;
+        const unsigned int wy1 = sy.fraction;
+        for (unsigned int x = 0; x < targetWidth; ++x)
+        {
+            const JpegGuAxisSample sx = xSamples[x];
+            const unsigned int wx0 = 256u - sx.fraction;
+            const unsigned int wx1 = sx.fraction;
+            const unsigned char *p00 = row0 + sx.first * 3u;
+            const unsigned char *p10 = row0 + sx.second * 3u;
+            const unsigned char *p01 = row1 + sx.first * 3u;
+            const unsigned char *p11 = row1 + sx.second * 3u;
+            unsigned int rgb[3];
+            for (unsigned int component = 0; component < 3; ++component)
+            {
+                const unsigned int top = p00[component] * wx0 + p10[component] * wx1;
+                const unsigned int bottom = p01[component] * wx0 + p11[component] * wx1;
+                rgb[component] = (top * wy0 + bottom * wy1 + 32768u) >> 16;
+            }
+            const unsigned short pixel = static_cast<unsigned short>(
+                (rgb[0] >> 3) | ((rgb[1] >> 2) << 5) | ((rgb[2] >> 3) << 11));
+            const unsigned int byteX = x * 2u;
+            const unsigned int offset = swizzled
+                ? (((y >> 3) * (outputRowBytes >> 4) + (byteX >> 4)) << 7) +
+                      ((y & 7u) << 4) + (byteX & 15u)
+                : y * outputRowBytes + byteX;
+            output[offset] = static_cast<unsigned char>(pixel);
+            output[offset + 1u] = static_cast<unsigned char>(pixel >> 8);
+        }
+    }
+    // libjpeg requires all original rows to be consumed before finish. Reuse
+    // the same scratch slots for any rows not needed by the final sample.
+    while (cinfo->output_scanline < cinfo->output_height)
+    {
+        JSAMPROW row = rows + (cinfo->output_scanline & 1u) * rowBytes;
+        if (jpeg_read_scanlines(cinfo, &row, 1) != 1)
+            JpegErrorExit(reinterpret_cast<j_common_ptr>(cinfo));
+    }
+    if (!jpeg_finish_decompress(cinfo))
+        JpegErrorExit(reinterpret_cast<j_common_ptr>(cinfo));
+    jpeg_destroy_decompress(cinfo);
+    free(rowsToFree);
+    free(cinfo);
+    return 1;
 }
 
 static SDL_Surface *LoadJpegFromMem(const Uint8 *data, size_t size)

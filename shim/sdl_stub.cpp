@@ -268,6 +268,16 @@ extern "C" Uint32 th06_psp_last_locked_surface_serial()
     return g_PspLastLockedSurfaceSerial;
 }
 
+extern "C" int th06_psp_surface_serial_alive(Uint32 serial)
+{
+    if (serial == 0)
+        return 0;
+    for (SDL_Surface *surface : g_PspSurfaces)
+        if (surface && surface->pspSerial == serial)
+            return 1;
+    return 0;
+}
+
 extern "C" void th06_psp_mark_surface_ge_cached(Uint32 serial, int cached)
 {
     for (unsigned int i = 0; i < sizeof(g_PspSurfaces) / sizeof(g_PspSurfaces[0]); ++i)
@@ -321,6 +331,8 @@ SDL_Surface *SDL_CreateRGBSurfaceWithFormat(Uint32, int width, int height, int, 
 SDL_Surface *SDL_CreateRGBSurfaceWithFormatFrom(void *pixels, int width, int height, int depth, int pitch, Uint32 format)
 {
     SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, 0, 0, depth, format);
+    if (!s)
+        return nullptr;
     std::free(s->pixels);
     s->pixels = pixels;
     s->w = width;
@@ -334,13 +346,12 @@ void SDL_FreeSurface(SDL_Surface *surface)
     if (!surface)
         return;
 #ifdef TH06_PSP
-    // The GE owns a downscaled copy only while its source surface is alive.
-    // Retire that unborrowed copy before releasing the source allocation so a
-    // title/demo image replacement cannot leave a 512 KiB hole in PSP-1000's
-    // heap until the later GameManager boundary.
+    // Remove the lifetime pin before trimming a cache-only JPEG. A live GU
+    // handle still protects borrowed pixels; Trim also completes queued GE
+    // reads before freeing an unborrowed entry.
+    PspUnregisterSurface(surface);
     if (surface->pspGeCached)
         th06_psp_ge_trim_surface_cache();
-    PspUnregisterSurface(surface);
 #endif
     if (!(surface->flags & 1))
         std::free(surface->pixels);

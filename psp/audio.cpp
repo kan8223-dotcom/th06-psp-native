@@ -4,6 +4,8 @@
 #include <cstring>
 
 #include "audio_me.h"
+#include "midi/MidiPsp.hpp"
+#include "diag.hpp"
 
 namespace {
 // A 1024-frame hardware block is 23.2 ms at 44.1 kHz.  The old output path
@@ -101,6 +103,11 @@ extern "C" int th06_psp_audio_init(void)
     if (gChannel < 0)
         return -1;
     th06_psp_me_audio_init();
+    if (th06_psp_me_poisoned())
+        th06_psp_require_power_off("ME BOOT SELFTEST NOT ACKNOWLEDGED");
+    // MIDI players (psp/midi): needs the ME worker state decided above and
+    // runs before the BGM producer thread exists.
+    th06_midi_audio_attach();
     __atomic_store_n(&gAlive, true, __ATOMIC_RELEASE);
     gOutputThread = sceKernelCreateThread("th06_audio_out", AudioOutputThread, 0x10, 0x4000,
                                           PSP_THREAD_ATTR_USER, nullptr);

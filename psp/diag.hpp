@@ -79,6 +79,9 @@ extern "C"
     // Fatal paths that still have a functioning kernel can leave a readable
     // screen and return to XMB without relying on the engine or GE.
     void th06_psp_fatal_exit(const char *title, const char *detail);
+    // Unacknowledged ME must retain heap, mailbox and code until power-off.
+    // Never auto-exits or changes the device's power state.
+    void th06_psp_require_power_off(const char *detail) __attribute__((noreturn));
 
 }
 

@@ -25,6 +25,16 @@
 - [PPSSPP](https://github.com/hrydgard/ppsspp) — 高速な事前検証に使用。最終判定はPSP実機です。
 - PSP homebrew community、m-c/d、Acid_Snake、およびPSPハードウェア研究の各貢献者。
 
+## MIDI合成器・シーケンサ
+
+- [touhou_dls_common](https://github.com/kan8223-dotcom/th06-psp-native/blob/v1.1.0-preview/third_party/touhou_dls_common/README.md) — 本プロジェクト向けの共通DLS読込、
+  音色サブセット生成、整数合成器、TH06用MIDIシーケンサ。ソースをGPLv3で同梱しています。
+  ライセンス全文は[third_party/touhou_dls_common/LICENSE](https://github.com/kan8223-dotcom/th06-psp-native/blob/v1.1.0-preview/third_party/touhou_dls_common/LICENSE)を参照してください。
+  配布ZIPにも`licenses/touhou_dls_common/LICENSE`として含めています。
+- Microsoft GS Wavetable Synth（MSGS）の音色ファイル`gm.dls`は利用者が自分で用意します。
+  Microsoftのプログラム本体、音色・波形データ、生成キャッシュ、原作MIDI曲は同梱しません。
+  この合成器はWindowsのMSGSプログラムを実行するものではなく、音声の完全一致も保証しません。
+
 ## 同梱またはリンクするthird-party
 
 - FreeType — 動的日本語テキスト描画。
@@ -32,7 +42,8 @@
   配布版はCP932で表現可能な文字へsubsetした`NotoSansJP-Regular.ttf`を含みます。
 - libpng、libjpeg、zlib、bzip2 — 原作assetのdecodeに使用。
 - TinySoundFont — Bernhard Schelling / SFZero: Steve Folta、MIT License。
-  MIDI経路のコード上の依存です。サウンドフォントは配布しません。
+  上流由来のソースツリーにヘッダとPS3用コードを保持していますが、PSPの`gm.dls` MIDI合成器では
+  使用しません。サウンドフォントは配布しません。
 
 本プロジェクトについて、上記の原作者・上流・参照先へ問い合わせないでください。
 これらのプロジェクトは本移植のサポート窓口ではありません。

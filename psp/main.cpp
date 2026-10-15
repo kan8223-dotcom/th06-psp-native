@@ -12,6 +12,7 @@
 #include "diag.hpp"
 #include "fileio.hpp"
 #include "memory.hpp"
+#include "midi/MidiPsp.hpp"
 #include "video.hpp"
 
 PSP_MODULE_INFO("TH06 PSP bootstrap", 0, 1, 0);
@@ -295,6 +296,18 @@ int main(int argc, char **argv)
         sceKernelExitGame();
         return 2;
     }
+    // gm.dls subset cache for MIDI BGM (built on the first boot, before the
+    // engine allocates anything, so the temporary 6-8 MB peak cannot collide
+    // with game assets).  Without gm.dls this only logs one line.
+    th06_midi_boot_prepare();
+#if defined(TH06_PSP_MIDI_PCMTEST)
+    {
+        th06_psp_watchdog_disarm();
+        th06_midi_pcm_test();
+        sceKernelExitGame();
+        return 0;
+    }
+#endif
     th06_psp_boot_note("ENGINE ENTER");
 
     const int result = th06_engine_main(argc, argv);
@@ -310,7 +323,9 @@ int main(int argc, char **argv)
         th06_psp_text_draw(8, 100, 3, 0xffffffffu, "ENGINE RETURNED");
         th06_psp_text_draw(8, 140, 2, 0xffd0d0d0u, "PRESS START");
     }
+#if !defined(TH06_PSP_RECORD_SOAK)
     HoldResultScreen(15);
+#endif
 
     sceKernelExitGame();
     return result;

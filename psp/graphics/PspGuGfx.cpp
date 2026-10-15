@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <malloc.h>
+#include <newlib.h>
 #include <zlib.h>
 
 #include "AnmManager.hpp"
@@ -21,7 +22,11 @@
 #include "diag.hpp"
 #include "fileio.hpp"
 #include "memory.hpp"
+#include "psp_jpeg_gu.hpp"
 #include "video.hpp"
+#if defined(TH06_PSP_RENDER_HASH_TEST)
+#include "graphics/RenderHashTest.hpp"
+#endif
 
 namespace
 {
@@ -52,7 +57,7 @@ constexpr unsigned int kDeferredVertexArenaBytes = 384 * 1024;
 // Real hardware rejected the ME-packed vertex stream twice with the same
 // geometry corruption.  Compile its callsite out entirely; ME remains
 // available to the independent PCM mixer only.
-constexpr bool kMeVertexPackingEnabled = false;
+constexpr bool kMeVertexPackingEnabled = TH06_PSP_ME_VERTEX_PACKING_ENABLED != 0;
 constexpr int kMeVertexPackMinCount = 96;
 
 // sceGuStart() converts this list to the PSP's 0x40000000 uncached alias.
@@ -146,10 +151,12 @@ struct SurfaceCacheEntry
     float sampleScaleY;
     bool valid;
     bool swizzled;
+    bool cacheOnlySource;
 };
 
 extern "C" unsigned int th06_psp_last_locked_surface_serial();
 extern "C" void th06_psp_mark_surface_ge_cached(unsigned int serial, int cached);
+extern "C" int th06_psp_surface_serial_alive(unsigned int serial);
 
 class PspGuGfx;
 PspGuGfx *gPspGuBackend;
@@ -174,6 +181,39 @@ struct GePerfFlightRecord
 
 GePerfFlightRecord gGePerfFlight{};
 volatile unsigned int gGePerfFlightSequence;
+
+// Frame pacing (MISS).  TH06 advances its simulation once per presented frame,
+// so a present-to-present interval longer than 1.5 vblank periods means the
+// 60 Hz sim ran slow there.  Counted on the render thread; the cumulative
+// totals are read by the diagnostic thread (psp/diag.cpp).
+constexpr unsigned long long kVblankUs = 16683ull;
+unsigned long long gPacingLastPresentUs;
+unsigned int gPacingWindowFrames, gPacingWindowMisses, gPacingWindowExtraVblanks, gPacingWindowWorstUs;
+volatile unsigned int gPacingFrames, gPacingMisses, gPacingExtraVblanks, gPacingWorstUs;
+
+void RecordFramePacing(unsigned long long presentUs)
+{
+    const unsigned long long last = gPacingLastPresentUs;
+    gPacingLastPresentUs = presentUs;
+    if (last == 0 || presentUs <= last)
+        return;
+    const unsigned long long interval = presentUs - last;
+    const unsigned int intervalUs = interval > 0xffffffffull ? 0xffffffffu : static_cast<unsigned int>(interval);
+    ++gPacingWindowFrames;
+    __atomic_fetch_add(&gPacingFrames, 1u, __ATOMIC_RELAXED);
+    if (intervalUs > gPacingWindowWorstUs)
+        gPacingWindowWorstUs = intervalUs;
+    if (intervalUs > __atomic_load_n(&gPacingWorstUs, __ATOMIC_RELAXED))
+        __atomic_store_n(&gPacingWorstUs, intervalUs, __ATOMIC_RELAXED);
+    if (interval * 2ull > kVblankUs * 3ull)
+    {
+        const unsigned int extra = static_cast<unsigned int>((interval + kVblankUs / 2ull) / kVblankUs) - 1u;
+        ++gPacingWindowMisses;
+        gPacingWindowExtraVblanks += extra;
+        __atomic_fetch_add(&gPacingMisses, 1u, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&gPacingExtraVblanks, extra, __ATOMIC_RELAXED);
+    }
+}
 
 void PublishGePerfFlight(const GePerfFlightRecord &candidate)
 {
@@ -218,6 +258,35 @@ unsigned int DiffuseColor(const unsigned char *src)
 unsigned int BytesPerPixel(int psm)
 {
     return psm == GU_PSM_8888 ? 4u : 2u;
+}
+
+bool CanShrinkPooledTexture(void *pixels, unsigned int oldBytes, unsigned int newBytes)
+{
+#if TH06_PSP_NEWLIB_4_5_0_DLMALLOC == 1 && __NEWLIB__ == 4 && \
+    __NEWLIB_MINOR__ == 5 && __NEWLIB_PATCHLEVEL__ == 0 && TH06_PSP_NEWLIB_MALLOC_ALIGNMENT == 16
+    // The installed PSPSDK libc_a-reallocr.o was audited: a smaller rounded
+    // request branches from _realloc_r+0x58 to +0x1d0, splits/frees the tail
+    // at +0x244/+0x268, and returns the original pointer at +0x204. No copy
+    // or malloc path is entered, so memalign(16)'s alignment is preserved.
+    const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(pixels);
+    if (sizeof(void *) != 4u || sizeof(std::size_t) != 4u || (address & 15u) != 0 ||
+        address < 0x08000000u || address >= 0x0c000000u || newBytes < 16u ||
+        oldBytes <= newBytes || oldBytes - newBytes < 16u || oldBytes > 1024u * 1024u ||
+        oldBytes > 0x0c000000u - address)
+        return false;
+    // Check only this still-allocated, unowned pool block. This public O(1)
+    // allocator query adds no heap/bin scan to the product render path.
+    const std::size_t usableBytes = malloc_usable_size(pixels);
+    // Classic non-mmap chunks expose chunksize-4 usable bytes. The +4
+    // multiple-of-16 check also rejects an unexpected allocator layout.
+    return usableBytes >= oldBytes && usableBytes <= 1024u * 1024u + 16u &&
+           usableBytes <= 0x0c000000u - address && ((usableBytes + 4u) & 15u) == 0u;
+#else
+    (void)pixels;
+    (void)oldBytes;
+    (void)newBytes;
+    return false;
+#endif
 }
 
 ScePspFMatrix4 ToGuMatrix(const ZunMatrix &matrix)
@@ -814,9 +883,11 @@ class PspGuGfx final : public GfxInterface
     void SetTextureSubImage(i32 xoffset, i32 yoffset, i32 width, i32 height, const void *data) override
     {
         FlushDeferredDraw();
-        if (mBoundTexture == 0 || !data)
+        if (mBoundTexture == 0)
             return;
         GuTexture &texture = mTextures[mBoundTexture];
+        if (!data && !texture.surfaceCandidate)
+            return;
         if (mAppliedTexture == mBoundTexture)
             mAppliedTexture = ~0u;
         if ((!texture.pixels && !texture.surfaceCandidate) || xoffset < 0 || yoffset < 0 ||
@@ -900,6 +971,75 @@ class PspGuGfx final : public GfxInterface
         }
     }
 
+#if defined(TH06_PSP_RECORD_LAYOUT)
+    void DumpTextureLayout(const char *scene) const
+    {
+        // Called only at the diagnostic harness's existing scene boundary.
+        // Walk the existing ownership tables directly: no snapshot array,
+        // pixel/allocator reads, synchronization, or renderer state changes.
+        // Borrowed texture handles alias a cache owner and must not enter
+        // the byte sum a second time. Include invalid-but-retained caches.
+        unsigned long long owningBytes = 0;
+        unsigned long long cacheBytes = 0;
+        unsigned long long poolBytes = 0;
+        unsigned int owningCount = 0;
+        unsigned int cacheCount = 0;
+        unsigned int poolCount = 0;
+        unsigned int borrowedCount = 0;
+        th06_psp_boot_notef("HEAP OWNER BEGIN %.24s TALLOC%uB", scene ? scene : "?", mTextureBytes);
+        for (unsigned int i = 1; i < kMaxTextures; ++i)
+        {
+            const GuTexture &texture = mTextures[i];
+            if (!texture.used || !texture.pixels)
+                continue;
+            if (texture.borrowedSurfaceCache)
+            {
+                ++borrowedCount;
+                continue;
+            }
+            ++owningCount;
+            owningBytes += texture.allocationBytes;
+            th06_psp_boot_notef("HEAP OWNER TEX H%u P%08X L%uB A%uB D%ux%u S%ux%u F%d", i,
+                                static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(texture.pixels)),
+                                texture.bytes, texture.allocationBytes, texture.width, texture.height,
+                                texture.storageWidth, texture.storageHeight, texture.psm);
+        }
+        for (unsigned int i = 0; i < kSurfaceCacheEntries; ++i)
+        {
+            const SurfaceCacheEntry &entry = mSurfaceCache[i];
+            if (!entry.pixels)
+                continue;
+            ++cacheCount;
+            cacheBytes += entry.allocationBytes;
+            th06_psp_boot_notef("HEAP OWNER CACHE I%u P%08X V%u SERIAL%u ALIVE%u ONLY%u BORROW%u L%uB A%uB", i,
+                                static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(entry.pixels)),
+                                entry.valid ? 1u : 0u, entry.surfaceSerial,
+                                th06_psp_surface_serial_alive(entry.surfaceSerial) ? 1u : 0u,
+                                entry.cacheOnlySource ? 1u : 0u, IsSurfaceCacheBorrowed(entry) ? 1u : 0u,
+                                entry.bytes, entry.allocationBytes);
+            th06_psp_boot_notef("HEAP OWNER CACHE DIM I%u D%ux%u S%ux%u C%ux%u", i,
+                                entry.logicalWidth, entry.logicalHeight, entry.storageWidth,
+                                entry.storageHeight, entry.contentWidth, entry.contentHeight);
+        }
+        for (unsigned int i = 0; i < kMaxTextures; ++i)
+        {
+            const FreeTextureBlock &block = mFreeTextureBlocks[i];
+            if (!block.pixels)
+                continue;
+            ++poolCount;
+            poolBytes += block.bytes;
+            th06_psp_boot_notef("HEAP OWNER POOL I%u P%08X A%uB", i,
+                                static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(block.pixels)), block.bytes);
+        }
+        const unsigned long long tagSum = owningBytes + cacheBytes + poolBytes;
+        th06_psp_boot_notef("HEAP OWNER SUM OWN%lluB CACHE%lluB POOL%lluB TAGSUM%lluB TALLOC%uB MATCH%u",
+                            owningBytes, cacheBytes, poolBytes, tagSum, mTextureBytes,
+                            tagSum == mTextureBytes ? 1u : 0u);
+        th06_psp_boot_notef("HEAP OWNER END %.24s NOWN%u NCACHE%u NPOOL%u NBORROW%u",
+                            scene ? scene : "?", owningCount, cacheCount, poolCount, borrowedCount);
+    }
+#endif
+
     unsigned int TrimSurfaceCache()
     {
         bool hasUnborrowedEntry = false;
@@ -907,6 +1047,8 @@ class PspGuGfx final : public GfxInterface
         {
             const SurfaceCacheEntry &entry = mSurfaceCache[cacheIndex];
             if (!entry.valid || !entry.pixels)
+                continue;
+            if (IsPinnedDirectSurface(entry))
                 continue;
             bool borrowed = false;
             for (int textureIndex = 1; textureIndex < kMaxTextures; ++textureIndex)
@@ -937,6 +1079,8 @@ class PspGuGfx final : public GfxInterface
             SurfaceCacheEntry &entry = mSurfaceCache[cacheIndex];
             if (!entry.valid || !entry.pixels)
                 continue;
+            if (IsPinnedDirectSurface(entry))
+                continue;
             bool borrowed = false;
             for (int textureIndex = 1; textureIndex < kMaxTextures; ++textureIndex)
             {
@@ -957,6 +1101,141 @@ class PspGuGfx final : public GfxInterface
             entry = SurfaceCacheEntry{};
         }
         return freed;
+    }
+
+    unsigned int ReleaseFreeTexturePool()
+    {
+        // Recycled blocks have no live texture owner, but a previously queued
+        // GE draw may still fetch them. Complete that list before returning
+        // these blocks to newlib for MIDI's bounded song/surface budget.
+        SubmitAndRestart();
+        return ReleaseFreeTextureBlocks();
+    }
+
+    unsigned int PromoteJpegCacheOnly(SDL_Surface *surface)
+    {
+        if (!surface || !surface->pixels || !surface->format || !surface->pspGeCached ||
+            surface->format->format != SDL_PIXELFORMAT_RGB24 || (surface->flags & 1u) != 0 ||
+            surface->refcount != 1 || surface->w <= 512 || surface->h <= 0 ||
+            surface->w > 4096 || surface->h > 4096 || surface->pitch != surface->w * 3 ||
+            !th06_psp_surface_serial_alive(surface->pspSerial))
+            return 0;
+        for (SurfaceCacheEntry &entry : mSurfaceCache)
+        {
+            if (!entry.valid || !entry.pixels || entry.cacheOnlySource ||
+                entry.surfaceSerial != surface->pspSerial || entry.psm != GU_PSM_5650 ||
+                entry.logicalWidth != NextPowerOfTwo(surface->w) ||
+                entry.logicalHeight != NextPowerOfTwo(surface->h) ||
+                entry.contentWidth != static_cast<unsigned int>(surface->w) ||
+                entry.contentHeight != static_cast<unsigned int>(surface->h))
+                continue;
+            // Immutable large JPEGs already bypass RGB extraction on cache
+            // hits. Pin that exact filtered image before dropping its CPU
+            // copy; no re-decode, resampling or visible texel changes occur.
+            SubmitAndRestart();
+            entry.cacheOnlySource = true;
+            const unsigned int bytes = surface->pitch * surface->h;
+            std::free(surface->pixels);
+            surface->pixels = nullptr;
+            surface->flags |= 1u;
+            return bytes;
+        }
+        return 0;
+    }
+
+    SDL_Surface *LoadJpegCached(const unsigned char *data, std::size_t size)
+    {
+        unsigned int contentWidth = 0, contentHeight = 0;
+        if (!th06_psp_img_jpeg_dimensions(data, size, &contentWidth, &contentHeight) ||
+            contentWidth == 0 || contentHeight == 0 || contentWidth > 4096u || contentHeight > 4096u)
+            return nullptr;
+
+        GuTexture texture{};
+        texture.width = NextPowerOfTwo(contentWidth);
+        texture.height = NextPowerOfTwo(contentHeight);
+        // This path represents precisely the inherited large-surface copy.
+        // Smaller RGB images keep their ordinary CPU surface implementation.
+        if (texture.width <= 512u && texture.height <= 512u)
+            return nullptr;
+        texture.storageWidth = NextPowerOfTwo(std::min(texture.width, 512u));
+        texture.storageHeight = NextPowerOfTwo(std::min(texture.height, 512u));
+        texture.psm = GU_PSM_5650;
+        texture.bytes = texture.storageWidth * texture.storageHeight * BytesPerPixel(texture.psm);
+        texture.swizzled = texture.storageWidth * BytesPerPixel(texture.psm) >= 16u &&
+                           texture.storageHeight >= 8u;
+        if (!texture.swizzled)
+            return nullptr;
+        unsigned int dstWidth = 0, dstHeight = 0;
+        ConfigureSurfaceSampling(texture, contentWidth, contentHeight, &dstWidth, &dstHeight);
+
+        SurfaceCacheEntry *entry = FindUnownedSurfaceCacheEntry();
+        if (!entry)
+            return nullptr;
+        // A retired SDL image can still have queued GE readers. Complete
+        // them before reusing its one final filtered allocation.
+        SubmitAndRestart();
+        if (entry->surfaceSerial != 0)
+            th06_psp_mark_surface_ge_cached(entry->surfaceSerial, 0);
+        entry->valid = false;
+        entry->cacheOnlySource = false;
+        if (entry->pixels && entry->allocationBytes < texture.bytes)
+            DiscardSurfaceCacheEntry(*entry);
+        if (!entry->pixels)
+        {
+            if (g_Supervisor.cfg.musicMode == MIDI &&
+                g_Supervisor.curState == SUPERVISOR_STATE_MAINMENU)
+                ReleaseHighFreeTextureBlock(texture.bytes);
+            entry->pixels = AcquireTexturePixels(texture.bytes, &entry->allocationBytes);
+            if (!entry->pixels)
+            {
+                const unsigned int freed = ReleaseFreeTextureBlocks();
+                if (freed != 0)
+                    entry->pixels = AcquireTexturePixels(texture.bytes, &entry->allocationBytes);
+            }
+        }
+        if (!entry->pixels ||
+            !th06_psp_img_load_jpeg_gu565(data, size, entry->pixels, entry->allocationBytes,
+                                        texture.storageWidth, texture.storageHeight, dstWidth, dstHeight))
+        {
+            DiscardSurfaceCacheEntry(*entry);
+            return nullptr;
+        }
+
+        SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormatFrom(nullptr, static_cast<int>(contentWidth),
+                                                                  static_cast<int>(contentHeight), 24,
+                                                                  static_cast<int>(contentWidth * 3u),
+                                                                  SDL_PIXELFORMAT_RGB24);
+        if (!surface || !th06_psp_surface_serial_alive(surface->pspSerial))
+        {
+            SDL_FreeSurface(surface);
+            DiscardSurfaceCacheEntry(*entry);
+            return nullptr;
+        }
+        entry->logicalWidth = texture.width;
+        entry->logicalHeight = texture.height;
+        entry->contentWidth = contentWidth;
+        entry->contentHeight = contentHeight;
+        entry->storageWidth = texture.storageWidth;
+        entry->storageHeight = texture.storageHeight;
+        entry->bytes = texture.bytes;
+        entry->psm = texture.psm;
+        entry->swizzled = texture.swizzled;
+        entry->sampleScaleX = texture.sampleScaleX;
+        entry->sampleScaleY = texture.sampleScaleY;
+        entry->crc = 0;
+        entry->surfaceSerial = surface->pspSerial;
+        entry->lastUse = ++mSurfaceCacheClock;
+        entry->cacheOnlySource = true;
+        entry->valid = true;
+        mSurfaceOomReported = false;
+        sceKernelDcacheWritebackRange(entry->pixels, entry->bytes);
+        sceGuTexFlush();
+        th06_psp_mark_surface_ge_cached(surface->pspSerial, 1);
+        const Th06PspHeapSnapshot heap = th06_psp_heap_snapshot();
+        th06_psp_boot_notef("GE JPEG CACHE %ux%u>%ux%u P%uKB T%uKB H%u/%uKB", contentWidth, contentHeight,
+                            dstWidth, dstHeight, entry->bytes / 1024u, mTextureBytes / 1024u,
+                            heap.usedBytes / 1024u, heap.freeBytes / 1024u);
+        return surface;
     }
 
     void Draw(PrimitiveType type, i32 start, i32 count) override
@@ -1288,12 +1567,39 @@ class PspGuGfx final : public GfxInterface
         const unsigned long long geStartUs = sceKernelGetSystemTimeWide();
         sceGuSync(0, 0);
         const unsigned long long geEndUs = sceKernelGetSystemTimeWide();
+#if defined(TH06_PSP_RENDER_HASH_TEST)
+        // Diagnostic-only: the existing sync has completed all deferred GE
+        // work. No extra submission, graphics state changes or pixel copies.
+        unsigned int hashStage = 0, hashFrame = 0;
+        int fpsValid = 0;
+        th06renderhash::Rect fps{};
+        if (th06_psp_render_hash_frame(&hashStage, &hashFrame, &fps, &fpsValid))
+        {
+            const unsigned int edram = reinterpret_cast<unsigned int>(sceGeEdramGetAddr());
+            const auto *base = reinterpret_cast<const unsigned char *>(
+                (0x40000000u | edram) + (mCurrentDrawBuffer ? kFrameBytes : 0u));
+            const th06renderhash::Result pixelHash =
+                th06renderhash::Pixels(base, kScreenWidth, kScreenHeight, kBufferWidth, fps);
+            char raw[65], noFps[65];
+            tdls::sha256Hex(pixelHash.raw, raw);
+            tdls::sha256Hex(pixelHash.noFps, noFps);
+            th06_psp_boot_notef("RENDERHASH ST%u F%u P%u 480x272 FPS%u,%u,%u,%u OK%d NZ%u VAR%u", hashStage,
+                                hashFrame, mFrames, fps.left, fps.top, fps.right, fps.bottom,
+                                pixelHash.valid && fpsValid == 1 ? 1 : 0, pixelHash.nonBlack, pixelHash.varied);
+            if (fpsValid != 1)
+                th06_psp_boot_notef("RENDERHASH FPS INVALID ST%u F%u REASON%u", hashStage, hashFrame,
+                                    static_cast<unsigned int>(-fpsValid));
+            th06_psp_boot_notef("RENDERHASH ST%u F%u RAW %s", hashStage, hashFrame, raw);
+            th06_psp_boot_notef("RENDERHASH ST%u F%u NOFPS %s", hashStage, hashFrame, noFps);
+        }
+#endif
         if (firstPresent)
             th06_psp_boot_note("GE FIRST SYNC OK");
 #if !defined(TH06_PSP_RECORD_SOAK)
         sceDisplayWaitVblankStart();
 #endif
         const unsigned long long vblankEndUs = sceKernelGetSystemTimeWide();
+        RecordFramePacing(vblankEndUs);
         sceGuSwapBuffers();
         if (traceTransitionSwap)
             th06_psp_boot_note("TRACE GE SWAP END");
@@ -1403,7 +1709,10 @@ class PspGuGfx final : public GfxInterface
                                     vblank10 % 10, drawsPerFrame, verticesPerFrame);
                 th06_psp_boot_notef("SC CALC%u.%u DRAW%u.%u REST%u.%u N%u/%u", calc10 / 10, calc10 % 10,
                                     draw10 / 10, draw10 % 10, rest10 / 10, rest10 % 10, calcCalls, drawCalls);
+                th06_psp_boot_notef("MISS %u/%u +%uVB WORST%uus", gPacingWindowMisses, gPacingWindowFrames,
+                                    gPacingWindowExtraVblanks, gPacingWindowWorstUs);
             }
+            gPacingWindowFrames = gPacingWindowMisses = gPacingWindowExtraVblanks = gPacingWindowWorstUs = 0;
             mPerfWindowStartUs = vblankEndUs;
             mPerfCpuUs = 0;
             mPerfGeUs = 0;
@@ -1638,6 +1947,36 @@ class PspGuGfx final : public GfxInterface
         return freed;
     }
 
+    unsigned int ReleaseHighFreeTextureBlock(unsigned int requestBytes)
+    {
+        // A large menu still can otherwise grow the heap above retired stage
+        // atlases. Hand back one highest-address standby block, permitting
+        // newlib to coalesce adjacent holes without discarding the remaining
+        // best-fit atlas pool needed by the next game. A fitting pool block
+        // already serves the request directly and needs no eviction.
+        int highest = -1;
+        for (int i = 0; i < kMaxTextures; ++i)
+        {
+            const FreeTextureBlock &block = mFreeTextureBlocks[i];
+            if (!block.pixels)
+                continue;
+            if (block.bytes >= requestBytes)
+                return 0;
+            if (highest < 0 || reinterpret_cast<std::uintptr_t>(block.pixels) >
+                                   reinterpret_cast<std::uintptr_t>(mFreeTextureBlocks[highest].pixels))
+                highest = i;
+        }
+        if (highest < 0)
+            return 0;
+        SubmitAndRestart();
+        FreeTextureBlock &block = mFreeTextureBlocks[highest];
+        const unsigned int freed = block.bytes;
+        mTextureBytes -= freed;
+        std::free(block.pixels);
+        block = FreeTextureBlock{};
+        return freed;
+    }
+
     void *AcquireTexturePixels(unsigned int bytes, unsigned int *allocationBytes)
     {
         int best = -1;
@@ -1651,7 +1990,41 @@ class PspGuGfx final : public GfxInterface
         if (best >= 0)
         {
             void *pixels = mFreeTextureBlocks[best].pixels;
-            *allocationBytes = mFreeTextureBlocks[best].bytes;
+            const unsigned int oldBytes = mFreeTextureBlocks[best].bytes;
+            unsigned int ownedBytes = oldBytes;
+            if (g_Supervisor.cfg.musicMode == MIDI &&
+                (g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER ||
+                 g_Supervisor.curState == SUPERVISOR_STATE_GAMEMANAGER_REINIT) &&
+                g_GameManager.difficulty != EXTRA && CanShrinkPooledTexture(pixels, oldBytes, bytes))
+            {
+                // Only a recycled block without a live texture/cache owner
+                // is resized, after completing every queued GE read.
+                SubmitAndRestart();
+                void *shrunk = std::realloc(pixels, bytes);
+                if (shrunk)
+                {
+                    if ((reinterpret_cast<std::uintptr_t>(shrunk) & 15u) != 0)
+                    {
+                        // realloc succeeded: the old pointer is no longer
+                        // usable. Fail closed into the existing aligned
+                        // allocation retry, never publish misaligned pixels.
+                        std::free(shrunk);
+                        mTextureBytes -= oldBytes;
+                        mFreeTextureBlocks[best] = FreeTextureBlock{};
+                        *allocationBytes = 0;
+                        return nullptr;
+                    }
+                    pixels = shrunk;
+                    ownedBytes = bytes;
+                    mTextureBytes -= oldBytes - bytes;
+#if defined(TH06_PSP_RECORD_SOAK)
+                    th06_psp_boot_notef("MIDI TEX POOL SHRINK %uB>%uB", oldBytes, bytes);
+#endif
+                }
+                // A NULL return retains the original aligned allocation and
+                // its complete accounting; the pool remains reusable.
+            }
+            *allocationBytes = ownedBytes;
             mFreeTextureBlocks[best] = FreeTextureBlock{};
             return pixels;
         }
@@ -1716,6 +2089,68 @@ class PspGuGfx final : public GfxInterface
         unsigned short fraction;
     };
 
+    bool IsPinnedDirectSurface(const SurfaceCacheEntry &entry) const
+    {
+        // A pixels-less SDL surface has no full-resolution copy from which
+        // to rebuild this cache. Its serial must keep the final pixels alive
+        // even between temporary borrowed draw handles.
+        return entry.cacheOnlySource && entry.surfaceSerial != 0 &&
+               th06_psp_surface_serial_alive(entry.surfaceSerial);
+    }
+
+    bool IsSurfaceCacheBorrowed(const SurfaceCacheEntry &entry) const
+    {
+        for (int i = 1; i < kMaxTextures; ++i)
+            if (mTextures[i].used && mTextures[i].borrowedSurfaceCache &&
+                mTextures[i].pixels == entry.pixels)
+                return true;
+        return false;
+    }
+
+    SurfaceCacheEntry *FindUnownedSurfaceCacheEntry()
+    {
+        SurfaceCacheEntry *chosen = nullptr;
+        for (int i = 0; i < kSurfaceCacheEntries; ++i)
+        {
+            SurfaceCacheEntry &entry = mSurfaceCache[i];
+            if (IsPinnedDirectSurface(entry) || (entry.pixels && IsSurfaceCacheBorrowed(entry)))
+                continue;
+            if (!entry.valid)
+                return &entry;
+            if (!chosen || entry.lastUse < chosen->lastUse)
+                chosen = &entry;
+        }
+        return chosen;
+    }
+
+    void DiscardSurfaceCacheEntry(SurfaceCacheEntry &entry)
+    {
+        if (entry.surfaceSerial != 0)
+            th06_psp_mark_surface_ge_cached(entry.surfaceSerial, 0);
+        if (entry.pixels)
+        {
+            mTextureBytes -= entry.allocationBytes;
+            std::free(entry.pixels);
+        }
+        entry = SurfaceCacheEntry{};
+    }
+
+    static void ConfigureSurfaceSampling(GuTexture &texture, unsigned int contentWidth,
+                                         unsigned int contentHeight, unsigned int *dstWidth,
+                                         unsigned int *dstHeight)
+    {
+        *dstWidth = std::min(texture.storageWidth,
+                            static_cast<unsigned int>(g_Supervisor.cfg.windowed ? kContentWidth : kScreenWidth));
+        // Staff scrolls a logical 640x480 window across a 640x780 image. Keep
+        // its complete 442-row image at the same vertical scale as a still.
+        const unsigned int scaledContentHeight = (contentHeight * kScreenHeight + 479u) / 480u;
+        *dstHeight = std::min(texture.storageHeight, scaledContentHeight);
+        texture.sampleScaleX = static_cast<float>(*dstWidth) * static_cast<float>(texture.width) /
+                               (static_cast<float>(texture.storageWidth) * contentWidth);
+        texture.sampleScaleY = static_cast<float>(*dstHeight) * static_cast<float>(texture.height) /
+                               (static_cast<float>(texture.storageHeight) * contentHeight);
+    }
+
     static void BuildSurfaceAxisSamples(SurfaceAxisSample *samples, unsigned int destinationSize,
                                         unsigned int sourceSize)
     {
@@ -1740,6 +2175,11 @@ class PspGuGfx final : public GfxInterface
         unsigned long crc = 0;
         if (surfaceSerial == 0)
         {
+            if (!source)
+            {
+                mError = true;
+                return;
+            }
             const unsigned int sourceBytes = static_cast<unsigned int>(contentWidth * contentHeight * 3);
             crc = crc32(crc32(0L, Z_NULL, 0), source, sourceBytes);
         }
@@ -1747,11 +2187,14 @@ class PspGuGfx final : public GfxInterface
             return;
 
         SurfaceCacheEntry *entry = nullptr;
+        bool cacheOnlyIdentity = false;
         for (int i = 0; i < kSurfaceCacheEntries; ++i)
         {
             SurfaceCacheEntry &candidate = mSurfaceCache[i];
             const bool identityMatches = surfaceSerial != 0 ? candidate.surfaceSerial == surfaceSerial
                                                             : candidate.surfaceSerial == 0 && candidate.crc == crc;
+            if (identityMatches && candidate.cacheOnlySource)
+                cacheOnlyIdentity = true;
             if (candidate.valid && identityMatches && candidate.logicalWidth == texture.width &&
                 candidate.logicalHeight == texture.height && candidate.contentWidth == static_cast<unsigned int>(contentWidth) &&
                 candidate.contentHeight == static_cast<unsigned int>(contentHeight))
@@ -1763,16 +2206,31 @@ class PspGuGfx final : public GfxInterface
 
         if (!entry)
         {
-            entry = &mSurfaceCache[0];
+            if (!source || cacheOnlyIdentity)
+            {
+                // Cached metadata must hit by its live serial. A miss cannot
+                // reconstruct RGB from the zero-length extraction buffer.
+                mError = true;
+                th06_psp_boot_notef("GE JPEG CACHE MISS SERIAL%u %dx%d", surfaceSerial, contentWidth, contentHeight);
+                return;
+            }
             for (int i = 0; i < kSurfaceCacheEntries; ++i)
             {
+                if (IsPinnedDirectSurface(mSurfaceCache[i]) ||
+                    (mSurfaceCache[i].cacheOnlySource && IsSurfaceCacheBorrowed(mSurfaceCache[i])))
+                    continue;
                 if (!mSurfaceCache[i].valid)
                 {
                     entry = &mSurfaceCache[i];
                     break;
                 }
-                if (mSurfaceCache[i].lastUse < entry->lastUse)
+                if (!entry || mSurfaceCache[i].lastUse < entry->lastUse)
                     entry = &mSurfaceCache[i];
+            }
+            if (!entry)
+            {
+                mError = true;
+                return;
             }
 
             // An older queued draw may still fetch this cache slot.  Complete
@@ -1855,6 +2313,7 @@ class PspGuGfx final : public GfxInterface
             entry->crc = crc;
             entry->surfaceSerial = surfaceSerial;
             entry->valid = true;
+            entry->cacheOnlySource = false;
             std::memset(entry->pixels, 0, entry->bytes);
 
             GuTexture destination = texture;
@@ -1863,28 +2322,20 @@ class PspGuGfx final : public GfxInterface
             // engine's logical 1024x512 texture.  The old generic shrink made
             // only 320 horizontal texels, then GE enlarged them to 362.  Make
             // exactly one filtered image at the selected LCD output size.
-            const unsigned int dstWidth = std::min(texture.storageWidth,
-                                                   static_cast<unsigned int>(g_Supervisor.cfg.windowed
-                                                                                 ? kContentWidth
-                                                                                 : kScreenWidth));
             // A normal 640x480 still image occupies 272 LCD rows.  Ending
             // staff-roll surfaces are 640x780 and are cropped through a
             // moving 640x480 window; retaining only 272 rows would squash the
             // entire roll before the crop.  Preserve the same vertical scale
             // for the full source (780 -> 442), which still fits GE's 512-row
             // texture limit.
-            const unsigned int scaledContentHeight =
-                (static_cast<unsigned int>(contentHeight) * kScreenHeight + 479u) / 480u;
-            const unsigned int dstHeight = std::min(texture.storageHeight, scaledContentHeight);
+            unsigned int dstWidth = 0, dstHeight = 0;
+            ConfigureSurfaceSampling(destination, static_cast<unsigned int>(contentWidth),
+                                     static_cast<unsigned int>(contentHeight), &dstWidth, &dstHeight);
             SurfaceAxisSample xSamples[512];
             SurfaceAxisSample ySamples[512];
             BuildSurfaceAxisSamples(xSamples, dstWidth, static_cast<unsigned int>(contentWidth));
             BuildSurfaceAxisSamples(ySamples, dstHeight, static_cast<unsigned int>(contentHeight));
 
-            destination.sampleScaleX = static_cast<float>(dstWidth) * static_cast<float>(texture.width) /
-                                       (static_cast<float>(texture.storageWidth) * contentWidth);
-            destination.sampleScaleY = static_cast<float>(dstHeight) * static_cast<float>(texture.height) /
-                                       (static_cast<float>(texture.storageHeight) * contentHeight);
             entry->sampleScaleX = destination.sampleScaleX;
             entry->sampleScaleY = destination.sampleScaleY;
 
@@ -2214,4 +2665,43 @@ GfxInterface *Th06CreatePspGuBackend()
 extern "C" unsigned int th06_psp_ge_trim_surface_cache()
 {
     return gPspGuBackend ? gPspGuBackend->TrimSurfaceCache() : 0u;
+}
+
+extern "C" unsigned int th06_psp_ge_release_free_texture_pool()
+{
+    return gPspGuBackend ? gPspGuBackend->ReleaseFreeTexturePool() : 0u;
+}
+
+extern "C" SDL_Surface *th06_psp_ge_load_jpeg_cached(const unsigned char *data, std::size_t size)
+{
+    return gPspGuBackend ? gPspGuBackend->LoadJpegCached(data, size) : nullptr;
+}
+
+extern "C" unsigned int th06_psp_ge_promote_jpeg_cache_only(SDL_Surface *surface)
+{
+    return gPspGuBackend ? gPspGuBackend->PromoteJpegCacheOnly(surface) : 0u;
+}
+
+#if defined(TH06_PSP_RECORD_LAYOUT)
+extern "C" void th06_psp_ge_dump_texture_layout(const char *scene)
+{
+    if (gPspGuBackend)
+        gPspGuBackend->DumpTextureLayout(scene);
+    else
+        th06_psp_boot_notef("HEAP OWNER UNAVAILABLE %.24s", scene ? scene : "?");
+}
+#endif
+
+// Cumulative frame pacing since boot (see RecordFramePacing).
+extern "C" void th06_psp_frame_pacing(unsigned int *frames, unsigned int *misses, unsigned int *extraVblanks,
+                                      unsigned int *worstUs)
+{
+    if (frames)
+        *frames = __atomic_load_n(&gPacingFrames, __ATOMIC_RELAXED);
+    if (misses)
+        *misses = __atomic_load_n(&gPacingMisses, __ATOMIC_RELAXED);
+    if (extraVblanks)
+        *extraVblanks = __atomic_load_n(&gPacingExtraVblanks, __ATOMIC_RELAXED);
+    if (worstUs)
+        *worstUs = __atomic_load_n(&gPacingWorstUs, __ATOMIC_RELAXED);
 }

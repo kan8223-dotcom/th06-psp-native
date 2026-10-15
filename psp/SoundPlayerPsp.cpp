@@ -19,7 +19,9 @@
 #include <pspkernel.h>
 #include <pspsdk.h>
 #include <pspthreadman.h>
+#include <malloc.h>
 #include "audio_me.h"
+#include "midi/MidiPsp.hpp"
 #endif
 
 #ifdef TH06_PS3
@@ -123,7 +125,10 @@ struct PspBgmStream
     SDL_RWops *file;
     u32 dataOffset;
     u32 dataBytes;
-    alignas(64) i16 pcm[kBgmCacheBlockCount][kBgmCacheFrames * 2];
+    // 384 KiB の先読みキャッシュ。WAV を最初に開くときにヒープへ確保する（静的に持たない）。
+    // MIDI モード（gm.dls）では確保されず、その分がゲームの空きに残る。PSP-1000（32MB）
+    // は 3 面の読み込みと EX の読み込みで数百 KB 足りずに落ちていた（2026-10-14 実機ログ）。
+    i16 (*pcm)[kBgmCacheFrames * 2];
     BgmCacheBlock blocks[kBgmCacheBlockCount];
     volatile u32 generation;
     u32 fills;
@@ -131,7 +136,8 @@ struct PspBgmStream
 };
 
 PspBgmStream gBgmStream{};
-static_assert(sizeof(gBgmStream.pcm) == 384 * 1024, "BGM cache RAM budget changed");
+constexpr u32 kBgmCacheBytes = kBgmCacheBlockCount * kBgmCacheFrames * 2u * sizeof(i16);
+static_assert(kBgmCacheBytes == 384 * 1024, "BGM cache RAM budget changed");
 alignas(64) i16 gFinalMix[kMaxMixSamples];
 #ifndef TH06_PSP
 alignas(64) i32 gWideMix[kMaxMixSamples];
@@ -533,6 +539,22 @@ ZunResult SoundPlayer::InitializeDSound()
         goto fail;
     }
 
+    // Reserve the existing WAV window before title/stage textures fragment
+    // the heap. Its old static storage existed before any of those assets;
+    // allocating it in the first LoadWav inserted 384 KiB between them and
+    // left the ending -> Extra path unable to allocate face12a_a.png.
+    if (g_Supervisor.cfg.musicMode == WAV && gBgmStream.pcm == nullptr)
+    {
+        gBgmStream.pcm = static_cast<i16 (*)[kBgmCacheFrames * 2]>(memalign(64, kBgmCacheBytes));
+        if (gBgmStream.pcm == nullptr)
+            goto fail;
+    }
+    // MIDI reserves its smaller replacement window at the same early
+    // ownership boundary, before menu textures and the producer thread.
+    if (g_Supervisor.cfg.musicMode == MIDI && th06_midi_playable() &&
+        !th06_midi_prepare_song_storage(nullptr))
+        goto fail;
+
     if (!StartBgmPrefetchThread())
         goto fail;
 
@@ -543,6 +565,8 @@ ZunResult SoundPlayer::InitializeDSound()
 
 fail:
     StopBgmPrefetchThread();
+    free(gBgmStream.pcm);
+    gBgmStream.pcm = nullptr;
     if (this->audioDev != 0)
     {
         SDL_CloseAudioDevice(this->audioDev);
@@ -560,6 +584,8 @@ ZunResult SoundPlayer::Release(void)
 
     StopBGM();
     StopBgmPrefetchThread();
+    free(gBgmStream.pcm);
+    gBgmStream.pcm = nullptr;
 
     for (int i = 0; i < ARRAY_SIZE_SIGNED(this->soundBuffers); i++)
     {
@@ -583,13 +609,29 @@ ZunResult SoundPlayer::Release(void)
 void SoundPlayer::StopBGM()
 {
     ArcadeGcmNonRenderGuard arcadeGcmGuard(ARCADE_GCM_PHASE_BGM_STOP);
-    if (BgmIsOpen())
+    if (BgmIsOpen() || (gBgmStream.pcm != nullptr && g_Supervisor.cfg.musicMode != WAV))
     {
         this->soundBufMutex.lock();
         const u32 fills = gBgmStream.fills;
         const u32 shortReads = gBgmStream.shortReads;
         CloseBgmUnlocked(this);
+        // CloseBgmUnlocked also runs inside MixAudio while its descriptors
+        // still reference PCM. Release storage here, on the game thread,
+        // after the mixer and the old-generation file reader have finished.
+        const bool releaseCache = gBgmStream.pcm != nullptr && g_Supervisor.cfg.musicMode != WAV;
+        bool transferredCache = false;
+        if (releaseCache)
+        {
+            transferredCache = g_Supervisor.cfg.musicMode == MIDI && th06_midi_playable() &&
+                               th06_midi_prepare_song_storage(gBgmStream.pcm);
+            if (!transferredCache)
+                free(gBgmStream.pcm);
+            gBgmStream.pcm = nullptr;
+        }
         this->soundBufMutex.unlock();
+        if (releaseCache)
+            th06_psp_boot_note(transferredCache ? "BGM CACHE TRANSFER 384KB -> MIDI 208KB"
+                                                : "BGM CACHE RELEASE 384KB");
         th06_psp_boot_notef("BGM CLOSE R%lu S%lu", static_cast<unsigned long>(fills),
                             static_cast<unsigned long>(shortReads));
         utils::DebugPrint2("stop BGM\n");
@@ -757,7 +799,13 @@ ZunResult SoundPlayer::LoadWav(const char *path)
     // Two blocks (about 743 ms) are ready before playback begins.  The other
     // four are filled by the dedicated worker, shortening the stage-load I/O
     // burst while retaining the same 384 KiB steady-state read-ahead window.
-    firstBlockReady = FillBgmBlockNow(0, 0);
+    if (!gBgmStream.pcm)
+    {
+        gBgmStream.pcm = static_cast<i16 (*)[kBgmCacheFrames * 2]>(memalign(64, kBgmCacheBytes));
+        if (!gBgmStream.pcm)
+            th06_psp_boot_note("BGM CACHE ALLOC NG");
+    }
+    firstBlockReady = gBgmStream.pcm != nullptr && FillBgmBlockNow(0, 0);
     initialStart = firstBlockReady ? gBgmStream.blocks[0].frames : 0;
     if (firstBlockReady && initialStart < gBgmStream.dataBytes / 4 &&
         FillBgmBlockNow(1, initialStart))
@@ -788,7 +836,7 @@ ZunResult SoundPlayer::LoadWav(const char *path)
     heap = th06_psp_heap_snapshot();
     th06_psp_boot_notef("BGM OPEN %s %luKB C%luKB H%u/%uKB", path,
                         static_cast<unsigned long>(wavDataSize / 1024),
-                        static_cast<unsigned long>(sizeof(gBgmStream.pcm) / 1024),
+                        static_cast<unsigned long>(kBgmCacheBytes / 1024),
                         heap.usedBytes / 1024u, heap.freeBytes / 1024u);
 
     return ZUN_SUCCESS;
@@ -1069,6 +1117,13 @@ void SoundPlayer::MixAudio(u32 samples)
     std::memset(gWideMix, 0, samples * sizeof(gWideMix[0]));
 #endif
 
+#ifdef TH06_PSP
+    // MIDI BGM (psp/midi): synthesized on the ME, or on the SC as a fallback,
+    // before taking soundBufMutex -- the player state belongs to this thread
+    // and the game thread only queues commands.  It enters the same mix as the
+    // WAV BGM: one stereo input at gain 1.0, counted as one playing channel.
+    const short *midiPcm = th06_midi_render_for_mix(samples / 2);
+#endif
 #ifdef TH06_PS3
     const u64 audTReq = AudNowUs();
 #endif
@@ -1077,6 +1132,13 @@ void SoundPlayer::MixAudio(u32 samples)
     const u64 audTLock = AudNowUs();
 #endif
 
+#ifdef TH06_PSP
+    if (midiPcm != nullptr)
+    {
+        addMixInput(midiPcm, samples / 2, 0, 2, 1.0f);
+        playingChannels++;
+    }
+#endif
 #ifdef TH06_PS3
     // The PS3 MIDI parser and TinySoundFont synth are sample-clocked by this
     // existing worker. No SDL timer or third PPU thread is involved.
@@ -1231,8 +1293,17 @@ void SoundPlayer::MixAudio(u32 samples)
 #ifdef TH06_PSP
     // Keep source buffers protected until ME is done.  A timeout mixes the
     // same descriptors on SC into a separate output buffer before returning.
-    mixJob.mixDivisor = std::max(8, (int)playingChannels);
-    th06_psp_me_audio_mix(&mixJob, gFinalMix);
+    // The original mixes DirectSound buffers at unity and clips at 16 bits; the
+    // inherited max(8, channels) divisor made the PSP about 18 dB quieter (WAV and
+    // MIDI alike).  Mix at unity; SC and ME saturate the 32-bit sum identically.
+    mixJob.mixDivisor = 1;
+    // MIDI has already completed one synchronous ME synthesis job above.
+    // Do not claim/sleep on that worker a second time just to add unity SE:
+    // reuse the existing SC work area (or copy the sole stereo MIDI input).
+    // Non-unity/WAV jobs keep the original Q16 ME path unchanged. This changes
+    // neither PCM lookahead nor the synth/event clock or any buffer lifetime.
+    if (midiPcm == nullptr || !th06_psp_me_audio_mix_unity_nowait(&mixJob, gFinalMix))
+        th06_psp_me_audio_mix(&mixJob, gFinalMix);
 #endif
     this->soundBufMutex.unlock();
 #ifdef TH06_PS3
@@ -1356,7 +1427,18 @@ void SoundPlayer::BackgroundMusicPlayerThread()
     // path discarded elapsed time after a scheduler/I/O stall without moving
     // the BGM source cursor, permanently delaying the song, and normally kept
     // only ~1024 frames queued--one 23 ms scheduling miss from starvation.
-    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 0x18);
+    const int priorityRc = sceKernelChangeThreadPriority(sceKernelGetThreadId(), 0x18);
+    const int actualPriority = sceKernelGetThreadCurrentPriority();
+    // Completion polling relies on output/escape preempting the producer,
+    // and on the producer outranking image decode. Verify that contract once
+    // before producing any PCM; never put this logging in the runtime loop.
+    th06_psp_boot_notef("AUDIO PRODUCER PRIORITY RC%d ACT%d EXPECT24", priorityRc, actualPriority);
+    if (actualPriority != 0x18)
+    {
+        th06_psp_boot_note("AUDIO PRODUCER PRIORITY FAILED");
+        th06_psp_request_exit(5);
+        return;
+    }
     constexpr u32 kTargetQueuedFrames = 3072; // 69.7 ms software cushion
     constexpr u32 kMaxFramesPerMix = kMaxMixSamples / 2;
     u64 lastProducerUs = 0;

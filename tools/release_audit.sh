@@ -2,7 +2,7 @@
 set -eu
 
 fail=0
-test_eboot_pattern='STAGE SOAK|RECORD SOAK|RESULT SOAK|PS3 REPLAY AUTO|EXACT REPLAY TRACE'
+test_eboot_pattern='STAGE SOAK|RECORD SOAK|RESULT SOAK|PS3 REPLAY AUTO|EXACT REPLAY TRACE|MIDI PCMTEST|MIDI PCM TEST|MIDI MEMSIM|PIXEL HASH|pixel hash test|RENDER HASH TEST|RENDERHASH|RENDEREND|RETENTION TEST|FUNCTIONAL_ONLY|DEVICE_RETENTION_PASS'
 
 # Build the retired MECC repository name at runtime so the forbidden spelling
 # does not become part of this repository merely because the audit checks it.
@@ -14,7 +14,11 @@ if [ -n "$obsolete_mecc_files" ]; then
     fail=1
 fi
 
-tracked_forbidden=$(git ls-files | grep -Ei '(^|/)(th6|bgm)(/|$)|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2|PBP|PSP)$|(^|/)(score\.dat|TH06PSP_DATA_PATH\.TXT)$' || true)
+# gm.dls (the user's Microsoft GS Wavetable Synth instruments), anything built
+# from it (the subset cache MIDICACHE.*, TDSB blobs) and MIDI songs must never
+# be tracked or shipped.
+gmdls_pattern='\.(dls|tdsb|mid|midi)$|(^|/)MIDICACHE\.(BIN|TMP)$'
+tracked_forbidden=$(git ls-files | grep -Ei "(^|/)(th6|bgm)(/|\$)|紅魔郷.*\.DAT\$|TH06[A-Z]*\.DAT\$|\.(wav|rpy|sf2|PBP|PSP)\$|(^|/)(score\.dat|TH06PSP_DATA_PATH\.TXT)\$|$gmdls_pattern" || true)
 if [ -n "$tracked_forbidden" ]; then
     echo "[FAIL] proprietary/user/generated files are tracked:"
     echo "$tracked_forbidden"
@@ -27,7 +31,7 @@ if [ -f EBOOT.PBP ] && strings EBOOT.PBP | grep -Eq "$test_eboot_pattern"; then
 fi
 
 if [ -d dist ]; then
-    release_forbidden=$(find dist -type f | grep -Ei '/(th6|bgm)/|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2)$|/(score\.dat|TH06PSP_DATA_PATH\.TXT)$' || true)
+    release_forbidden=$(find dist -type f | grep -Ei "/(th6|bgm)/|紅魔郷.*\.DAT\$|TH06[A-Z]*\.DAT\$|\.(wav|rpy|sf2)\$|/(score\.dat|TH06PSP_DATA_PATH\.TXT)\$|$gmdls_pattern" || true)
     if [ -n "$release_forbidden" ]; then
         echo "[FAIL] forbidden files entered dist/:"
         echo "$release_forbidden"
@@ -36,7 +40,7 @@ if [ -d dist ]; then
     for archive in dist/*.zip; do
         [ -f "$archive" ] || continue
         archive_entries=$(unzip -Z1 "$archive" | tr '\\' '/')
-        archive_forbidden=$(printf '%s\n' "$archive_entries" | grep -Ei '(^|/)(th6|bgm)/|紅魔郷.*\.DAT$|TH06[A-Z]*\.DAT$|\.(wav|rpy|sf2)$|/(score\.dat|TH06PSP_DATA_PATH\.TXT)$' || true)
+        archive_forbidden=$(printf '%s\n' "$archive_entries" | grep -Ei "(^|/)(th6|bgm)/|紅魔郷.*\.DAT\$|TH06[A-Z]*\.DAT\$|\.(wav|rpy|sf2)\$|/(score\.dat|TH06PSP_DATA_PATH\.TXT)\$|$gmdls_pattern" || true)
         if [ -n "$archive_forbidden" ]; then
             echo "[FAIL] forbidden files entered $archive:"
             echo "$archive_forbidden"
@@ -66,4 +70,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[OK] release audit: no original TH06 data, replay, score, test EBOOT, or obsolete MECC name"
+echo "[OK] release audit: no original TH06 data, gm.dls or its cache, replay, score, test EBOOT, or obsolete MECC name"

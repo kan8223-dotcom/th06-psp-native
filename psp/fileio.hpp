@@ -7,6 +7,7 @@ extern "C" void th06_psp_fileio_init();
 extern "C" const char *th06_psp_game_dir();
 extern "C" const char *th06_psp_data_dir();
 extern "C" int th06_psp_original_data_ready();
+extern "C" const char *th06_psp_retail_data_path(const char *engineName);
 extern "C" const char *th06_psp_boot_log_path();
 
 // Complete original-data roots found during the bounded boot scan.  Index 0

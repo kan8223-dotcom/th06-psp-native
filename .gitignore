@@ -29,3 +29,20 @@ score.dat
 TH06.CFG
 TH06PSP_DATA_PATH.TXT
 msgothic.ttc
+
+# The user's gm.dls (Microsoft GS Wavetable Synth instruments) and everything
+# built from it stay on the user's Memory Stick only.
+*.dls
+*.DLS
+*.tdsb
+*.mid
+*.MID
+MIDICACHE.BIN
+MIDICACHE.TMP
+MIDI.CFG
+
+# Local source snapshots, host bytecode and test outputs are not releases.
+*.before-*
+__pycache__/
+*.pyc
+third_party/touhou_dls_common/build/
