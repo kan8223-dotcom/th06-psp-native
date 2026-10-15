@@ -197,9 +197,10 @@ Keep `gm.dls` even after the cache is created. All six original DAT archives and
 No SF2 file or Windows MSGS executable is required.
 If an old cache remains after replacing the instruments, remove `MIDICACHE.BIN` and restart to rebuild it.
 
-Without usable instruments/backend, BGM falls back to WAV. PSP-1000 requires the ME for MIDI;
-PSP-2000/3000 and later models also have a main-CPU synthesis fallback, without a performance guarantee.
-The normal release EBOOT has no automatic controls, invulnerability, or unattended-test exit.
+PSP-1000/2000/3000 normally synthesize MIDI on the ME; PSP-3000 uses the ME too.
+64 MB models such as PSP-2000/3000 also have a main-CPU (SC) synthesis fallback for when the ME is
+unavailable or disabled in the settings. PSP-1000 requires the ME for MIDI.
+Without usable instruments/backend, BGM falls back to WAV.
 
 `gm.dls` is Microsoft's copyrighted instrument file. Neither it, instrument/waveform data, its generated cache,
 nor the original MIDI songs are included. Supply your own file and do not upload these files to the repository

@@ -15,8 +15,9 @@
 
 MIDIはPSPの合成器でリアルタイム演奏します。WindowsのMSGSプログラムそのものを移植・実行する方式では
 ありません。`gm.dls`が無い、読み込めない、またはMIDIプレイヤーを使えない場合はWAVへ戻ります。
-PSP-1000ではMIDI合成にMEが必要です。PSP-2000/3000などの64MB機にはSC合成経路もあります。
-通常版に自動操作・無敵・試験用の自動終了はありません。
+PSP-1000/2000/3000とも、通常はMEでMIDIを合成します。PSP-3000もMEを使用します。
+PSP-2000/3000などの64MB機には、MEが利用できない場合や設定でMEを無効にした場合の
+予備経路としてSC合成もあります。PSP-1000ではMIDIにMEが必要です。
 
 ## 確認範囲と既知の制約（2026-10-15）
 
@@ -45,7 +46,9 @@ Keep the original `gm.dls`, all six DAT archives, and all 17 WAV tracks on the M
 If stale instruments remain after replacing the file, exit the game, remove only `MIDICACHE.BIN`, and restart.
 
 This uses a PSP synthesizer, not the Windows MSGS executable. Unavailable MIDI falls back to WAV.
-PSP-1000 requires the ME; 64 MB models such as PSP-2000/3000 also have a main-CPU synthesis path.
+PSP-1000/2000/3000 normally synthesize MIDI on the ME, including PSP-3000.
+64 MB models such as PSP-2000/3000 also have a main-CPU (SC) fallback when the ME is unavailable or
+disabled in the settings. PSP-1000 requires the ME for MIDI.
 
 Real-time MIDI playback reduces gameplay performance. Using the ME does not eliminate the synthesis overhead,
 and additional slowdown may occur. Select WAV BGM if gameplay performance is your priority.
