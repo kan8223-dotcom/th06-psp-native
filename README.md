@@ -20,7 +20,7 @@
 
 ## 現在の状態
 
-MIDI対応版のダウンロード: [v1.1.0-preview](https://github.com/kan8223-dotcom/th06-psp-native/releases/tag/v1.1.0-preview)
+MIDI対応版のダウンロード: [v1.1.1](https://github.com/kan8223-dotcom/th06-psp-native/releases/tag/v1.1.1)
 
 2026-10-15のプレビュー版は、利用者自身の`gm.dls`を使ったMIDI演奏に対応しています。
 MEの完了をメインCPUで空回しして待つ処理を撤回し、待機中はゲーム側へCPUを返す方式にしました。

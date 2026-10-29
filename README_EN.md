@@ -22,7 +22,7 @@ It is not an emulator, and it is unrelated to the older project with the similar
 
 ## Current status
 
-Download the MIDI build: [v1.1.0-preview](https://github.com/kan8223-dotcom/th06-psp-native/releases/tag/v1.1.0-preview).
+Download the MIDI build: [v1.1.1](https://github.com/kan8223-dotcom/th06-psp-native/releases/tag/v1.1.1).
 
 The 2026-10-15 preview supports real-time MIDI playback using your own `gm.dls`.
 Main-CPU busy polling during ME completion waits was removed; waiting now yields CPU time to the game.
