@@ -38,7 +38,7 @@ static const CharacterPowerBulletData g_CharacterPowerBulletDataReimuARank2[3] =
 
 /* ReimuA Rank 3 */
 static const CharacterPowerBulletData g_CharacterPowerBulletDataReimuARank3[4] = {
-    {5, 0, {-4.0, 0.0}, {12.0, 12.0}, RADIANS(-91.0), 12.0, 30, 0, BULLET_TYPE_0, ANM_SCRIPT_PLAYER_BULLET, NO_SOUND},
+    {5, 0, {-4.0, 0.0}, {12.0, 12.0}, RADIANS(-91.0), 12.0, 30, 0, BULLET_TYPE_0, ANM_SCRIPT_PLAYER_BULLET, SOUND_SHOOT},
     {5, 0, {4.0, 0.0}, {12.0, 12.0}, RADIANS(-89.0), 12.0, 30, 0, BULLET_TYPE_0, ANM_SCRIPT_PLAYER_BULLET, NO_SOUND},
     {30,
      0,
