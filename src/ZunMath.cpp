@@ -30,6 +30,24 @@ void ZunViewport::Get()
     this->y = (viewPortGet[1] - VIEWPORT_OFF_Y) / HEIGHT_RESOLUTION_SCALE;
     this->width = viewPortGet[2] / WIDTH_RESOLUTION_SCALE;
     this->height = viewPortGet[3] / HEIGHT_RESOLUTION_SCALE;
+#if defined(TH06_PSP)
+    // The backend keeps the whole-pixel rect ZunViewport::Set truncated
+    // (480 -> 272 lines: the playfield's 16 / 448 come back as 15.88 /
+    // 446.47).  Built from that, the RHW (orthographic) mapping put the
+    // playfield's own bottom edge 0.8 px above the viewport's, so a spell
+    // card backdrop never reached the last playfield line (the fog-coloured
+    // 1px line).  Every TH06 viewport lies on the 16-unit grid: snap back.
+    {
+        auto snap = [](f32 v) {
+            const f32 g = 16.0f * (f32)(i32)(v / 16.0f + 0.5f);
+            return (v - g < 2.5f && g - v < 2.5f) ? g : v;
+        };
+        this->x = snap(this->x);
+        this->y = snap(this->y);
+        this->width = snap(this->width);
+        this->height = snap(this->height);
+    }
+#endif
     this->minZ = depthRangeGet[0];
     this->maxZ = depthRangeGet[1];
 

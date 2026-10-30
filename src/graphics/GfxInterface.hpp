@@ -166,6 +166,14 @@ struct GfxInterface
     virtual void CaptureStageBackground()
     {
     }
+    // 1.02h with "Clear back buffer on refresh" off (its default): while a
+    // spell card runs the stage is not drawn and the card's translucent
+    // backdrop blends over the previous frame's playfield (the red build-up
+    // and the bullet trails).  Backends that clear every frame put the last
+    // shown frame's playfield back here.  Others: nothing.
+    virtual void RestorePreviousPlayfield()
+    {
+    }
     virtual void ReleaseStageBackground()
     {
     }

@@ -949,6 +949,65 @@ class PspGuGfx final : public GfxInterface
         sceGuTexFlush();
     }
 
+    // Spell cards (Stage::OnDrawLowPrio): copy the current viewport's
+    // rectangle -- the playfield, in whichever layout -- from the shown
+    // buffer (the previous frame) into the draw buffer, as a GE sprite blit
+    // (in order with the clear drawn before it).  Colour only; VRAM to VRAM.
+    void RestorePreviousPlayfield() override
+    {
+        FlushDeferredDraw();
+        const int x = mScreenRect[0], y = mScreenRect[1], w = mScreenRect[2], h = mScreenRect[3];
+        if (w <= 1 || h <= 1)
+            return;
+        const unsigned int edram = reinterpret_cast<unsigned int>(sceGeEdramGetAddr());
+        void *front = reinterpret_cast<void *>(edram + (mCurrentDrawBuffer ? 0u : kFrameBytes));
+        const int blendOn = sceGuGetStatus(GU_BLEND), depthOn = sceGuGetStatus(GU_DEPTH_TEST),
+                  fogOn = sceGuGetStatus(GU_FOG), alphaOn = sceGuGetStatus(GU_ALPHA_TEST);
+        sceGuDisable(GU_DEPTH_TEST);
+        sceGuDepthMask(GU_TRUE);
+        sceGuDisable(GU_FOG);
+        sceGuDisable(GU_ALPHA_TEST);
+        sceGuDisable(GU_BLEND);
+        sceGuEnable(GU_TEXTURE_2D);
+        sceGuTexMode(GU_PSM_8888, 0, 0, GU_FALSE);
+        sceGuTexImage(0, 512, 512, kBufferWidth, front);
+        sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+        sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+        sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+        sceGuTexFlush();
+        sceGuEnable(GU_SCISSOR_TEST);
+        sceGuScissor(x, y, x + w, y + h);
+        struct V
+        {
+            unsigned short u, v;
+            short x, y, z;
+        };
+        const int strips = (w + 31) / 32;
+        V *v = static_cast<V *>(sceGuGetMemory(static_cast<int>(sizeof(V)) * 2 * strips));
+        for (int i = 0; i < strips; ++i)
+        {
+            const int x0 = x + i * 32, x1 = std::min(x + w, x0 + 32);
+            v[2 * i] = V{static_cast<unsigned short>(x0), static_cast<unsigned short>(y), static_cast<short>(x0),
+                         static_cast<short>(y), 0};
+            v[2 * i + 1] = V{static_cast<unsigned short>(x1), static_cast<unsigned short>(y + h),
+                             static_cast<short>(x1), static_cast<short>(y + h), 0};
+        }
+        sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2 * strips, nullptr, v);
+        sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+        sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+        if (blendOn) sceGuEnable(GU_BLEND); else sceGuDisable(GU_BLEND);
+        ApplyBlendMode();
+        if (depthOn) sceGuEnable(GU_DEPTH_TEST); else sceGuDisable(GU_DEPTH_TEST);
+        sceGuDepthMask(mDepthWrite ? GU_FALSE : GU_TRUE);
+        if (fogOn) sceGuEnable(GU_FOG); else sceGuDisable(GU_FOG);
+        if (alphaOn) sceGuEnable(GU_ALPHA_TEST); else sceGuDisable(GU_ALPHA_TEST);
+        mAppliedTexture = ~0u;
+        mTextureEnableKnown = false;
+        mColorOpKnown = false;
+        mPrimitiveColorKnown = false;
+        ApplyViewport();
+    }
+
     void ReadPixels(i32 x, i32 y, i32 width, i32 height, const void *pixels) override
     {
         if (!pixels || width <= 0 || height <= 0)
@@ -1773,6 +1832,7 @@ class PspGuGfx final : public GfxInterface
     float mFogFar;
     ZunColor mFogColor;
     i32 mViewport[4];
+    int mScreenRect[4] = {}; // mViewport on the LCD (ApplyViewport), every layout
     float mDepthRange[2];
     unsigned int mFrames;
     unsigned long long mFirstFrameUs;
@@ -2411,6 +2471,8 @@ class PspGuGfx final : public GfxInterface
         int width = std::max(1, static_cast<int>(mViewport[2]));
         int height = std::max(1, static_cast<int>(mViewport[3]));
         int top = kScreenHeight - (static_cast<int>(mViewport[1]) + height);
+        const int engineX = x, engineTop = top, engineW = width, engineH = height;
+        bool stretched = false;
 
         if (!g_Supervisor.cfg.windowed)
         {
@@ -2419,10 +2481,40 @@ class PspGuGfx final : public GfxInterface
             // aperture to the complete 480-wide LCD at the backend boundary,
             // matching PS3 FULL STRETCH without changing engine coordinates.
             const int right = x + width;
+            stretched = true;
             x = ((x - kPillarWidth) * kScreenWidth) / kContentWidth;
             const int stretchedRight =
                 ((right - kPillarWidth) * kScreenWidth + kContentWidth - 1) / kContentWidth;
             width = stretchedRight - x;
+        }
+
+#if defined(TH06_PSP_NCSKIN)
+        if (!NcLayout())
+#endif
+        {
+            // ZunViewport::Set hands over a rect truncated to whole pixels
+            // (playfield y 9.07 -> 9, h 253.87 -> 253, so its top lands on row
+            // 10), and the stretch truncates again (x 23.87 -> 23).  The HUD
+            // frame tiles end at row 8 and start again at row 263, so row 9
+            // belonged to nobody and row 262 lay past the backdrop's edge: a
+            // 1px line of the fog clear colour over a spell card backdrop.
+            // Back to logical units (TH06 viewports lie on a 16-unit grid,
+            // as in the NC branch) and round the exact edges instead.
+            auto snap = [](float v) {
+                const float g = 16.0f * static_cast<float>(static_cast<int>(v / 16.0f + 0.5f));
+                return (v - g < 2.5f && g - v < 2.5f) ? g : v;
+            };
+            const float lx = snap((engineX - kPillarWidth) * (640.0f / kContentWidth));
+            const float lr = snap((engineX + engineW - kPillarWidth) * (640.0f / kContentWidth));
+            const float ly = snap(engineTop * (480.0f / kScreenHeight));
+            const float lb = snap((engineTop + engineH) * (480.0f / kScreenHeight));
+            const float sx = stretched ? kScreenWidth / 640.0f : kContentWidth / 640.0f;
+            const float ox = stretched ? 0.0f : static_cast<float>(kPillarWidth);
+            const float sy = kScreenHeight / 480.0f;
+            x = static_cast<int>(ox + lx * sx + 0.5f);
+            width = static_cast<int>(ox + lr * sx + 0.5f) - x;
+            top = static_cast<int>(ly * sy + 0.5f);
+            height = static_cast<int>(lb * sy + 0.5f) - top;
         }
 
         top = std::max(0, top);
@@ -2433,6 +2525,10 @@ class PspGuGfx final : public GfxInterface
             height = kScreenHeight - top;
         width = std::max(width, 1);
         height = std::max(height, 1);
+        mScreenRect[0] = x;
+        mScreenRect[1] = top;
+        mScreenRect[2] = width;
+        mScreenRect[3] = height;
 
         sceGuOffset(2048 - (x + width / 2), 2048 - (top + height / 2));
         sceGuViewport(2048, 2048, width, height);

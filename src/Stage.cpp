@@ -291,6 +291,14 @@ ChainCallbackResult Stage::OnDrawLowPrio(Stage *stage)
         {
             g_AnmManager->SetAndExecuteScriptIdx(&stage->spellcardBackground, ANM_SCRIPT_EFFECTS_SPELLCARD_BACKGROUND);
         }
+        if (stage->spellcardState > RUNNING)
+        {
+            // Past the 60-tick fade the stage is no longer drawn: like 1.02h's
+            // default (no back buffer clear), the backdrop goes over the
+            // previous frame's playfield, not over the fog-colour clear.
+            g_AnmManager->FlushVertexBuffer();
+            g_GfxBackend->RestorePreviousPlayfield();
+        }
         g_AnmManager->Draw(&stage->spellcardBackground);
     }
     g_AnmManager->FlushVertexBuffer();
